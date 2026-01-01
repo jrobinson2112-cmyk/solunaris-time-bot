@@ -1,12 +1,31 @@
 # solunaris_time_bot.py
 #
-# VC name: Solunaris | HH:MM | Day X
-# Slash commands (GUILD ONLY):
-#   /day (everyone)
-#   /calibrate (admin only)
+# ✅ Voice channel name format:
+#    Solunaris | HH:MM | Day X
 #
-# One-time cleanup:
-#   deletes GLOBAL application commands so you don't get duplicates
+# ✅ Updates the VC name safely every 60s (avoids Discord 429 rate limits)
+# ✅ Time conversion (measured day & night): 20 in-game minutes = 94 real seconds
+# ✅ Auto year rolling: 1 year = 365 days (Year increases after Day 365)
+#
+# ✅ Slash commands (guild-scoped = instant):
+#    /day                 (everyone)
+#    /calibrate           (ADMIN ONLY)
+#
+# ✅ Fixes "Application command not found":
+#    - ONLY syncs guild commands (no global command deletion in code)
+#    - clears + syncs guild command tree on startup
+#    - prints which commands are registered
+#
+# REQUIRED Railway Variables:
+#   DISCORD_TOKEN
+#   VOICE_CHANNEL_ID
+#
+# OPTIONAL Railway Variables:
+#   DEFAULT_YEAR (default 1)
+#
+# NOTE:
+#   If you previously created global slash commands, Discord may show duplicates
+#   for up to ~1 hour. Guild commands will work immediately.
 
 import os
 import time
@@ -31,14 +50,15 @@ if not _voice_id:
     raise RuntimeError("VOICE_CHANNEL_ID is not set in Railway Variables")
 VOICE_CHANNEL_ID = int(_voice_id)
 
-CURRENT_YEAR = int(os.getenv("DEFAULT_YEAR", 1))
+DEFAULT_YEAR = int(os.getenv("DEFAULT_YEAR", 1))
 
 DAYS_PER_YEAR = 365
 ARK_DAY_SECONDS = 86400
 
-# 20 in-game minutes = 94 real seconds (day & night)
+# ✅ Measured: 20 in-game minutes = 94 real seconds
 ARK_SECONDS_PER_REAL_SECOND = (20 * 60) / 94  # 12.7659574468
 
+# Internal loop checks frequently, but we only rename VC at most once per 60s.
 CHECK_INTERVAL_SECONDS = 2
 RENAME_INTERVAL_SECONDS = 60
 
@@ -48,10 +68,10 @@ intents = discord.Intents.default()
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 # ------------------ STATE ------------------
-REFERENCE_REAL_TIME = None
-REF_YEAR = None
-REF_DAY_OF_YEAR = None
-REF_TOD_SECONDS = None
+REFERENCE_REAL_TIME = None   # real unix timestamp when calibrated
+REF_YEAR = None              # year at calibration moment
+REF_DAY_OF_YEAR = None       # day (1..365) at calibration moment
+REF_TOD_SECONDS = None       # time-of-day (seconds) at calibration moment
 
 _last_name = None
 _last_rename = 0.0
@@ -67,6 +87,15 @@ def parse_hhmm(hhmm: str):
     if not (0 <= h <= 23 and 0 <= m <= 59):
         raise ValueError("Invalid time. HH 0-23, MM 0-59.")
     return h, m
+
+
+def is_calibrated() -> bool:
+    return (
+        REFERENCE_REAL_TIME is not None
+        and REF_YEAR is not None
+        and REF_DAY_OF_YEAR is not None
+        and REF_TOD_SECONDS is not None
+    )
 
 
 def save_state():
@@ -101,6 +130,7 @@ def calibrate_state(day_of_year: int, hh: int, mm: int, year: int):
     global REFERENCE_REAL_TIME, REF_YEAR, REF_DAY_OF_YEAR, REF_TOD_SECONDS
     if not (1 <= day_of_year <= DAYS_PER_YEAR):
         raise ValueError("Day must be 1–365")
+
     REFERENCE_REAL_TIME = time.time()
     REF_YEAR = year
     REF_DAY_OF_YEAR = day_of_year
@@ -109,6 +139,7 @@ def calibrate_state(day_of_year: int, hh: int, mm: int, year: int):
 
 
 def get_state():
+    """Return (year, day_of_year, hhmm) based on calibration + elapsed real time."""
     now = time.time()
     real_elapsed = now - REFERENCE_REAL_TIME
     ark_elapsed = real_elapsed * ARK_SECONDS_PER_REAL_SECOND
@@ -132,9 +163,10 @@ def get_state():
 
 
 async def update_channel(force: bool = False):
+    """Rename the voice channel (rate-limit safe)."""
     global _last_name, _last_rename
 
-    if REFERENCE_REAL_TIME is None:
+    if not is_calibrated():
         return
 
     channel = bot.get_channel(VOICE_CHANNEL_ID)
@@ -168,7 +200,7 @@ async def clock_loop():
 # ------------------ SLASH COMMANDS (GUILD ONLY) ------------------
 @bot.tree.command(name="day", description="Show current Solunaris time", guild=GUILD_OBJ)
 async def day_slash(interaction: discord.Interaction):
-    if REFERENCE_REAL_TIME is None:
+    if not is_calibrated():
         await interaction.response.send_message(
             "⚠️ Not calibrated yet. Ask an admin to run `/calibrate`.",
             ephemeral=True,
@@ -189,10 +221,9 @@ async def day_slash(interaction: discord.Interaction):
 @app_commands.default_permissions(administrator=True)
 @app_commands.describe(day="Day (1–365)", time="Time HH:MM")
 async def calibrate_slash(interaction: discord.Interaction, day: int, time: str):
-    global CURRENT_YEAR
     try:
         hh, mm = parse_hhmm(time)
-        calibrate_state(day, hh, mm, CURRENT_YEAR)
+        calibrate_state(day, hh, mm, DEFAULT_YEAR)
         await update_channel(force=True)
         await interaction.response.send_message(
             f"✅ Calibrated → Solunaris | {hh:02d}:{mm:02d} | Day {day}"
@@ -211,22 +242,12 @@ async def on_ready():
     print(f"Logged in as {bot.user} | state_loaded={loaded}")
 
     try:
-        # 1) One-time cleanup: delete GLOBAL commands so duplicates disappear
-        global_cmds = await bot.tree.fetch_commands()
-        if global_cmds:
-            for c in global_cmds:
-                await bot.tree.remove_command(c.name)  # remove from local tree reference
-            # This actually pushes deletions to Discord:
-            await bot.tree.sync()
-            print("🧹 Deleted GLOBAL commands to prevent duplicates")
-
-        # 2) Reset + sync guild commands (instant)
+        # ✅ Clear and sync ONLY guild commands (fast + reliable)
         bot.tree.clear_commands(guild=GUILD_OBJ)
         await bot.tree.sync(guild=GUILD_OBJ)
 
         cmds = [c.name for c in bot.tree.get_commands(guild=GUILD_OBJ)]
-        print(f"✅ Commands in guild: {cmds}")
-        print("✅ Guild slash commands synced")
+        print(f"✅ Guild commands synced: {cmds}")
     except Exception as e:
         print(f"❌ Slash command sync failed: {e}")
 
