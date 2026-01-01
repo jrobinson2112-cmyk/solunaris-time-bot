@@ -15,13 +15,19 @@ WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 GUILD_ID = 1430388266393276509
 ADMIN_ROLE_ID = 1439069787207766076
 
-SECONDS_PER_INGAME_MINUTE = 4.7666667
-UPDATE_INTERVAL = 4.7666667  # seconds (safe)
+# Accurate from your measurement:
+# 1 in-game hour = 286 real seconds
+SECONDS_PER_INGAME_MINUTE = 286 / 60  # 4.7666667
+
+UPDATE_INTERVAL = 30  # seconds (safe for webhooks)
 
 STATE_FILE = "state.json"
 
-DAY_START = 6 * 60
-NIGHT_START = 18 * 60
+DAY_START = 6 * 60     # 06:00
+NIGHT_START = 18 * 60 # 18:00
+
+DAY_COLOR = 0xF1C40F   # Yellow
+NIGHT_COLOR = 0x5865F2 # Discord blue
 
 if not DISCORD_TOKEN or not WEBHOOK_URL:
     raise RuntimeError("Missing DISCORD_TOKEN or WEBHOOK_URL")
@@ -54,7 +60,7 @@ webhook_message_id = None
 # =====================
 def calculate_time():
     if not state:
-        return None
+        return None, None
 
     elapsed_real = time.time() - state["real_epoch"]
     elapsed_minutes = int(elapsed_real / SECONDS_PER_INGAME_MINUTE)
@@ -72,10 +78,14 @@ def calculate_time():
         day -= 365
         year += 1
 
-    is_day = DAY_START <= (hour * 60 + minute) < NIGHT_START
+    minute_index = hour * 60 + minute
+    is_day = DAY_START <= minute_index < NIGHT_START
     emoji = "☀️" if is_day else "🌙"
 
-    return f"{emoji} | Solunaris Time | {hour:02d}:{minute:02d} | Day {day} | Year {year}"
+    title = f"{emoji} | Solunaris Time | {hour:02d}:{minute:02d} | Day {day} | Year {year}"
+    color = DAY_COLOR if is_day else NIGHT_COLOR
+
+    return title, color
 
 # =====================
 # WEBHOOK UPDATE LOOP
@@ -88,20 +98,18 @@ async def update_loop():
     async with aiohttp.ClientSession() as session:
         while True:
             if state:
-                content = calculate_time()
-embed = {
-    "title": content,
-    "color": 0xF1C40F
-}
+                title, color = calculate_time()
+                embed = {
+                    "title": title,   # LARGE + BOLD
+                    "color": color
+                }
 
                 if webhook_message_id:
-                    # EDIT existing message
                     await session.patch(
                         f"{WEBHOOK_URL}/messages/{webhook_message_id}",
                         json={"embeds": [embed]},
                     )
                 else:
-                    # SEND once, then store message ID
                     async with session.post(
                         WEBHOOK_URL + "?wait=true",
                         json={"embeds": [embed]},
@@ -114,14 +122,24 @@ embed = {
 # =====================
 # SLASH COMMANDS
 # =====================
-@tree.command(name="day", description="Show current Solunaris time", guild=discord.Object(id=GUILD_ID))
+@tree.command(
+    name="day",
+    description="Show current Solunaris time",
+    guild=discord.Object(id=GUILD_ID),
+)
 async def day(interaction: discord.Interaction):
     if not state:
         await interaction.response.send_message("⏳ Time not set yet.", ephemeral=True)
         return
-    await interaction.response.send_message(calculate_time(), ephemeral=True)
 
-@tree.command(name="settime", description="Set Solunaris time", guild=discord.Object(id=GUILD_ID))
+    title, _ = calculate_time()
+    await interaction.response.send_message(title, ephemeral=True)
+
+@tree.command(
+    name="settime",
+    description="Set Solunaris time",
+    guild=discord.Object(id=GUILD_ID),
+)
 @app_commands.describe(
     year="Year number",
     day="Day of year (1–365)",
@@ -144,7 +162,7 @@ async def settime(interaction: discord.Interaction, year: int, day: int, hour: i
     save_state(state)
 
     await interaction.response.send_message(
-        f"✅ Set to Day {day}, {hour:02d}:{minute:02d}, Year {year}",
+        f"✅ Set to **Day {day}, {hour:02d}:{minute:02d}, Year {year}**",
         ephemeral=True,
     )
 
