@@ -8,12 +8,7 @@
 #
 # ✅ Slash commands (GUILD ONLY = instant):
 #    /day (everyone)
-#    /calibrate (ADMIN only)
-#
-# IMPORTANT:
-# - This file has ONE sync, ONCE, inside on_ready().
-# - It does NOT clear commands (you already ran the global clear tool).
-# - It does NOT sync global commands.
+#    /calibrate (Discord Admin role only)
 #
 # REQUIRED Railway Variables:
 #   DISCORD_TOKEN
@@ -59,6 +54,9 @@ ARK_SECONDS_PER_REAL_SECOND = 1200 / 94  # 12.7659574468
 # Safe rename cadence to avoid 429
 RENAME_INTERVAL_SECONDS = 60
 
+# Role allowed to run /calibrate
+CALIBRATE_ROLE_NAME = "Discord Admin"
+
 # ------------------ DISCORD CLIENT ------------------
 intents = discord.Intents.default()
 client = discord.Client(intents=intents)
@@ -84,6 +82,18 @@ def parse_hhmm(value: str) -> tuple[int, int]:
     if not (0 <= h <= 23 and 0 <= m <= 59):
         raise ValueError("Invalid time (HH 0–23, MM 0–59)")
     return h, m
+
+
+def has_role(interaction: discord.Interaction, role_name: str) -> bool:
+    """True if the invoking user has a role with the exact name."""
+    if interaction.guild is None or interaction.user is None:
+        return False
+
+    member = interaction.guild.get_member(interaction.user.id)
+    if member is None:
+        return False
+
+    return any(r.name == role_name for r in member.roles)
 
 
 def is_calibrated() -> bool:
@@ -137,7 +147,7 @@ def calibrate(day_of_year: int, hh: int, mm: int, year: int) -> None:
 
 def current_solunaris() -> tuple[int, int, str]:
     """
-    Returns (year, day_of_year, hhmm) from the stored calibration and real elapsed time.
+    Returns (year, day_of_year, hhmm) from stored calibration + real elapsed time.
     Year increments after day 365.
     """
     now = time.time()
@@ -203,7 +213,7 @@ async def tick():
 async def day_cmd(interaction: discord.Interaction):
     if not is_calibrated():
         await interaction.response.send_message(
-            "⚠️ Not calibrated yet. Use `/calibrate` (admin only).",
+            "⚠️ Not calibrated yet. Use `/calibrate` (Discord Admin role only).",
             ephemeral=True,
         )
         return
@@ -217,12 +227,19 @@ async def day_cmd(interaction: discord.Interaction):
 
 @tree.command(
     name="calibrate",
-    description="ADMIN ONLY: Calibrate Solunaris time",
+    description="Discord Admin only: Calibrate Solunaris time",
     guild=GUILD_OBJ,
 )
-@app_commands.checks.has_permissions(administrator=True)
 @app_commands.describe(day="Day (1–365)", time="Time HH:MM")
 async def calibrate_cmd(interaction: discord.Interaction, day: int, time: str):
+    # 🔐 Role check (NO Administrator permission required)
+    if not has_role(interaction, CALIBRATE_ROLE_NAME):
+        await interaction.response.send_message(
+            f"❌ You must have the **{CALIBRATE_ROLE_NAME}** role to use this command.",
+            ephemeral=True,
+        )
+        return
+
     try:
         hh, mm = parse_hhmm(time)
         calibrate(day_of_year=day, hh=hh, mm=mm, year=DEFAULT_YEAR)
