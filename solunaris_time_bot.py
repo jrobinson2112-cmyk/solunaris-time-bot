@@ -12,7 +12,7 @@ GUILD_ID = int(os.getenv("GUILD_ID"))
 VOICE_CHANNEL_ID = int(os.getenv("VOICE_CHANNEL_ID"))
 
 CALIBRATE_ROLE_ID = 1439069787207766076  # <-- REQUIRED ROLE
-UPDATE_INTERVAL = 60  # seconds (safe for rate limits)
+UPDATE_INTERVAL = 120  # seconds (safe for rate limits)
 
 # Measured conversion:
 # 20 in-game minutes = 94 real seconds => 1 in-game minute = 4.7 real seconds
