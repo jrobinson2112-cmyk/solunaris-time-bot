@@ -8,7 +8,7 @@
 #
 # ✅ Slash commands (GUILD ONLY = instant):
 #    /day (everyone)
-#    /calibrate (Discord Admin role only)
+#    /calibrate (ROLE ID only)
 #
 # REQUIRED Railway Variables:
 #   DISCORD_TOKEN
@@ -54,8 +54,8 @@ ARK_SECONDS_PER_REAL_SECOND = 1200 / 94  # 12.7659574468
 # Safe rename cadence to avoid 429
 RENAME_INTERVAL_SECONDS = 60
 
-# Role allowed to run /calibrate
-CALIBRATE_ROLE_NAME = "Discord Admin"
+# ✅ Only users with THIS role can run /calibrate
+CALIBRATE_ROLE_ID = 1439069787207766076
 
 # ------------------ DISCORD CLIENT ------------------
 intents = discord.Intents.default()
@@ -84,8 +84,7 @@ def parse_hhmm(value: str) -> tuple[int, int]:
     return h, m
 
 
-def has_role(interaction: discord.Interaction, role_name: str) -> bool:
-    """True if the invoking user has a role with the exact name."""
+def has_calibrate_role(interaction: discord.Interaction) -> bool:
     if interaction.guild is None or interaction.user is None:
         return False
 
@@ -93,7 +92,7 @@ def has_role(interaction: discord.Interaction, role_name: str) -> bool:
     if member is None:
         return False
 
-    return any(r.name == role_name for r in member.roles)
+    return any(role.id == CALIBRATE_ROLE_ID for role in member.roles)
 
 
 def is_calibrated() -> bool:
@@ -213,7 +212,7 @@ async def tick():
 async def day_cmd(interaction: discord.Interaction):
     if not is_calibrated():
         await interaction.response.send_message(
-            "⚠️ Not calibrated yet. Use `/calibrate` (Discord Admin role only).",
+            "⚠️ Not calibrated yet. Use `/calibrate`.",
             ephemeral=True,
         )
         return
@@ -227,15 +226,15 @@ async def day_cmd(interaction: discord.Interaction):
 
 @tree.command(
     name="calibrate",
-    description="Discord Admin only: Calibrate Solunaris time",
+    description="Calibrate Solunaris time (restricted role)",
     guild=GUILD_OBJ,
 )
 @app_commands.describe(day="Day (1–365)", time="Time HH:MM")
 async def calibrate_cmd(interaction: discord.Interaction, day: int, time: str):
-    # 🔐 Role check (NO Administrator permission required)
-    if not has_role(interaction, CALIBRATE_ROLE_NAME):
+    # 🔐 Role check (by ROLE ID)
+    if not has_calibrate_role(interaction):
         await interaction.response.send_message(
-            f"❌ You must have the **{CALIBRATE_ROLE_NAME}** role to use this command.",
+            "❌ You must have the required admin role to use `/calibrate`.",
             ephemeral=True,
         )
         return
