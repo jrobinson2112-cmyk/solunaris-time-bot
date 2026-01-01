@@ -15,8 +15,8 @@ WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 GUILD_ID = 1430388266393276509
 ADMIN_ROLE_ID = 1439069787207766076
 
-SECONDS_PER_INGAME_MINUTE = 4.9333
-UPDATE_INTERVAL = 4.9333  # seconds (safe)
+SECONDS_PER_INGAME_MINUTE = 4.7666667
+UPDATE_INTERVAL = 4.7666667  # seconds (safe)
 
 STATE_FILE = "state.json"
 
@@ -89,7 +89,10 @@ async def update_loop():
         while True:
             if state:
                 content = calculate_time()
-                embed = {"description": content}
+embed = {
+    "title": content,
+    "color": 0xF1C40F
+}
 
                 if webhook_message_id:
                     # EDIT existing message
