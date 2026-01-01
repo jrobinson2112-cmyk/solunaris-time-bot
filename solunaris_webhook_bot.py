@@ -19,7 +19,7 @@ ADMIN_ROLE_ID = 1439069787207766076
 # 1 in-game hour = 286 real seconds
 SECONDS_PER_INGAME_MINUTE = 286 / 60  # 4.7666667
 
-UPDATE_INTERVAL = 30  # seconds (safe for webhooks)
+UPDATE_INTERVAL = 4.7666667  # seconds (safe for webhooks)
 
 STATE_FILE = "state.json"
 
