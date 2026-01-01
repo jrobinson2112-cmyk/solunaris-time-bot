@@ -5,29 +5,32 @@ import time
 import os
 
 # =====================
-# CONFIG
+# CONFIG (Railway Variables)
 # =====================
 TOKEN = os.getenv("DISCORD_TOKEN")
 GUILD_ID = int(os.getenv("GUILD_ID"))
 VOICE_CHANNEL_ID = int(os.getenv("VOICE_CHANNEL_ID"))
 
-CALIBRATE_ROLE_ID = 1439069787207766076  # <-- REQUIRED ROLE
-UPDATE_INTERVAL = 120  # seconds (safe for rate limits)
+# Only users with THIS role can run /calibrate
+CALIBRATE_ROLE_ID = 1439069787207766076
+
+# Update interval (safe for Discord rate limits)
+UPDATE_INTERVAL = 120  # seconds
 
 # Measured conversion:
 # 20 in-game minutes = 94 real seconds => 1 in-game minute = 4.7 real seconds
 REAL_SECONDS_PER_INGAME_MINUTE = 4.7
 
 # Day/Night split (ARK-like)
-DAY_START_HOUR = 6    # 06:00
-NIGHT_START_HOUR = 18 # 18:00
+DAY_START_HOUR = 6     # 06:00
+NIGHT_START_HOUR = 18  # 18:00
 
 # =====================
-# STATE
+# STATE (in-memory; resets on restart)
 # =====================
-calibration_real_time = None
-calibration_day = None
-calibration_minute = None  # minute-of-day at calibration time
+calibration_real_time = None   # real unix timestamp when calibrated
+calibration_day = None         # in-game day at calibration
+calibration_minute = None      # in-game minute-of-day at calibration (0..1439)
 
 # =====================
 # BOT SETUP
@@ -40,6 +43,7 @@ tree = app_commands.CommandTree(bot)
 # HELPERS
 # =====================
 def get_day_night_emoji(hour: int) -> str:
+    # Keep the emoji form Discord likes
     return "☀️" if DAY_START_HOUR <= hour < NIGHT_START_HOUR else "🌙"
 
 
@@ -88,9 +92,8 @@ async def update_voice_channel():
     day, hour, minute = data
     emoji = get_day_night_emoji(hour)
 
-    # ✅ Voice Channel format:
-    # ☀️ Solunaris | 14:28 | Day 103
-    name = f"{emoji} Solunaris | {hour:02d}:{minute:02d} | Day {day}"
+    # ✅ Emoji at the start, with a zero-width space guard so Discord doesn't strip it
+    name = f"\u200B{emoji} Solunaris | {hour:02d}:{minute:02d} | Day {day}"
 
     channel = bot.get_channel(VOICE_CHANNEL_ID)
     if channel is None:
@@ -99,7 +102,7 @@ async def update_voice_channel():
     try:
         await channel.edit(name=name)
     except discord.HTTPException:
-        # If Discord blocks a rename momentarily, we just skip this cycle.
+        # If Discord blocks a rename momentarily, skip this cycle.
         pass
 
 # =====================
@@ -112,13 +115,17 @@ async def voice_channel_updater():
 # =====================
 # SLASH COMMANDS
 # =====================
-@tree.command(name="day", description="Show current Solunaris in-game time", guild=discord.Object(id=GUILD_ID))
+@tree.command(
+    name="day",
+    description="Show current Solunaris in-game time",
+    guild=discord.Object(id=GUILD_ID),
+)
 async def day(interaction: discord.Interaction):
     data = calculate_ingame_time()
     if data is None:
         await interaction.response.send_message(
             "❌ Time has not been calibrated yet. Use `/calibrate`.",
-            ephemeral=True
+            ephemeral=True,
         )
         return
 
@@ -127,24 +134,28 @@ async def day(interaction: discord.Interaction):
 
     await interaction.response.send_message(
         f"{emoji} **Solunaris Time**\nDay **{day_num}** — **{hour:02d}:{minute:02d}**",
-        ephemeral=True
+        ephemeral=True,
     )
 
 
-@tree.command(name="calibrate", description="Calibrate Solunaris time", guild=discord.Object(id=GUILD_ID))
+@tree.command(
+    name="calibrate",
+    description="Calibrate Solunaris time (restricted role)",
+    guild=discord.Object(id=GUILD_ID),
+)
 @app_commands.describe(day="Current in-game day", hour="Hour (0–23)", minute="Minute (0–59)")
 async def calibrate(interaction: discord.Interaction, day: int, hour: int, minute: int):
     if not await has_calibrate_role(interaction):
         await interaction.response.send_message(
-            "❌ You must have the required admin role to use this command.",
-            ephemeral=True
+            "❌ You must have the required admin role to use `/calibrate`.",
+            ephemeral=True,
         )
         return
 
     if not (0 <= hour <= 23 and 0 <= minute <= 59):
         await interaction.response.send_message(
             "❌ Invalid time. Hour must be 0–23 and minute must be 0–59.",
-            ephemeral=True
+            ephemeral=True,
         )
         return
 
@@ -159,7 +170,7 @@ async def calibrate(interaction: discord.Interaction, day: int, hour: int, minut
     emoji = get_day_night_emoji(hour)
     await interaction.response.send_message(
         f"✅ Calibrated to {emoji} **Solunaris | {hour:02d}:{minute:02d} | Day {day}**",
-        ephemeral=True
+        ephemeral=True,
     )
 
 # =====================
