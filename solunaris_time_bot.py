@@ -1,18 +1,13 @@
 # solunaris_time_bot.py
 #
-# ✅ Updates a VOICE CHANNEL name (Discord-safe: max once per 60s)
-# ✅ Uses your measured time conversion (day & night): 20 in-game minutes = 94 real seconds
-# ✅ Year/day rolling: Day is 1..365 (day-of-year). After Day 365 -> Day 1 and Year +1
-# ✅ SLASH COMMANDS with autocomplete:
-#    /day
-#    /calibrate day:123 time:14:28
+# Voice channel format:
+#   Solunaris | HH:MM | Day X
 #
-# REQUIRED Railway Variables:
-#   DISCORD_TOKEN
-#   VOICE_CHANNEL_ID
+# Slash commands (guild-scoped, instant):
+#   /day
+#   /calibrate (ADMIN ONLY)
 #
-# OPTIONAL Railway Variables:
-#   DEFAULT_YEAR (default 1)
+# Safe VC rename: max once every 60s
 
 import os
 import time
@@ -29,59 +24,47 @@ TOKEN = os.getenv("DISCORD_TOKEN")
 VOICE_CHANNEL_ID = int(os.getenv("VOICE_CHANNEL_ID"))
 CURRENT_YEAR = int(os.getenv("DEFAULT_YEAR", 1))
 
+# Your server ID (guild-scoped slash commands)
+GUILD_ID = 1430388266393276509
+
 # ------------------ CONSTANTS ------------------
 DAYS_PER_YEAR = 365
 ARK_DAY_SECONDS = 86400
 
-# ✅ Measured (day AND night): 20 in-game minutes = 94 real seconds
-# => in-game seconds per real second = (20*60) / 94 = 12.7659574468
+# Measured conversion:
+# 20 in-game minutes = 94 real seconds
 ARK_SECONDS_PER_REAL_SECOND = 12.7659574468
 
-# Emoji split (display only)
-DAY_START = int(5.5 * 3600)     # 05:30
-NIGHT_START = int(19.5 * 3600)  # 19:30
-
-# Loop/check vs rename throttling
 CHECK_INTERVAL_SECONDS = 2
-RENAME_INTERVAL_SECONDS = 60  # ✅ properly safe to avoid 429s
+RENAME_INTERVAL_SECONDS = 60
 
 STATE_FILE = "solunaris_state.json"
 
-# ------------------ DISCORD BOT ------------------
-# Slash commands do NOT require message_content intent
 intents = discord.Intents.default()
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 # ------------------ STATE ------------------
-# Saved calibration baseline:
-# "now" at calibration moment == (REF_YEAR, REF_DAY_OF_YEAR, REF_TOD_SECONDS)
 REFERENCE_REAL_TIME = None
 REF_YEAR = None
-REF_DAY_OF_YEAR = None   # rolling day-of-year (1..365) that you enter in /calibrate
-REF_TOD_SECONDS = None   # seconds since midnight at calibration moment
+REF_DAY_OF_YEAR = None
+REF_TOD_SECONDS = None
 
 _last_name = None
 _last_rename = 0.0
 
 
 # ------------------ HELPERS ------------------
-def is_daytime(tod: int) -> bool:
-    return DAY_START <= tod < NIGHT_START
-
-
 def parse_hhmm(hhmm: str):
-    hhmm = hhmm.strip()
     if ":" not in hhmm:
-        raise ValueError("Time must be HH:MM (example 14:28)")
-    h, m = hhmm.split(":", 1)
-    h, m = int(h), int(m)
+        raise ValueError("Time must be HH:MM")
+    h, m = map(int, hhmm.split(":"))
     if not (0 <= h <= 23 and 0 <= m <= 59):
-        raise ValueError("Invalid time. HH 0-23, MM 0-59.")
+        raise ValueError("Invalid time")
     return h, m
 
 
 def save_state():
-    with open(STATE_FILE, "w", encoding="utf-8") as f:
+    with open(STATE_FILE, "w") as f:
         json.dump(
             {
                 "real_time": REFERENCE_REAL_TIME,
@@ -90,88 +73,73 @@ def save_state():
                 "tod_seconds": REF_TOD_SECONDS,
             },
             f,
-            indent=2,
         )
 
 
-def load_state() -> bool:
+def load_state():
     global REFERENCE_REAL_TIME, REF_YEAR, REF_DAY_OF_YEAR, REF_TOD_SECONDS
     try:
-        with open(STATE_FILE, "r", encoding="utf-8") as f:
+        with open(STATE_FILE) as f:
             d = json.load(f)
-        REFERENCE_REAL_TIME = float(d["real_time"])
-        REF_YEAR = int(d["year"])
-        REF_DAY_OF_YEAR = int(d["day_of_year"])
-        REF_TOD_SECONDS = int(d["tod_seconds"])
+        REFERENCE_REAL_TIME = d["real_time"]
+        REF_YEAR = d["year"]
+        REF_DAY_OF_YEAR = d["day_of_year"]
+        REF_TOD_SECONDS = d["tod_seconds"]
         return True
     except Exception:
         return False
 
 
 def calibrate_state(day_of_year: int, hh: int, mm: int, year: int):
-    """
-    Sets "now" to Year=<year>, Day=<day_of_year> (rolling 1..365), time HH:MM.
-    """
     global REFERENCE_REAL_TIME, REF_YEAR, REF_DAY_OF_YEAR, REF_TOD_SECONDS
     if not (1 <= day_of_year <= DAYS_PER_YEAR):
         raise ValueError("Day must be 1–365")
     REFERENCE_REAL_TIME = time.time()
     REF_YEAR = year
     REF_DAY_OF_YEAR = day_of_year
-    REF_TOD_SECONDS = (hh * 3600) + (mm * 60)
+    REF_TOD_SECONDS = hh * 3600 + mm * 60
     save_state()
 
 
 def get_state():
-    """
-    Returns (year, day_of_year, hhmm, emoji)
-    Day rolls 1..365 and year increments after day 365.
-    """
-    now = time.time()
-    real_elapsed = now - REFERENCE_REAL_TIME
+    real_elapsed = time.time() - REFERENCE_REAL_TIME
     ark_elapsed = real_elapsed * ARK_SECONDS_PER_REAL_SECOND
 
     total_seconds = REF_TOD_SECONDS + ark_elapsed
     days_passed = int(total_seconds // ARK_DAY_SECONDS)
     tod = int(total_seconds % ARK_DAY_SECONDS)
 
-    day_of_year = REF_DAY_OF_YEAR + days_passed
+    day = REF_DAY_OF_YEAR + days_passed
     year = REF_YEAR
 
-    if day_of_year > DAYS_PER_YEAR:
-        years_forward = (day_of_year - 1) // DAYS_PER_YEAR
-        year += years_forward
-        day_of_year = ((day_of_year - 1) % DAYS_PER_YEAR) + 1
+    if day > DAYS_PER_YEAR:
+        year += (day - 1) // DAYS_PER_YEAR
+        day = ((day - 1) % DAYS_PER_YEAR) + 1
 
     h = tod // 3600
     m = (tod % 3600) // 60
-    hhmm = f"{h:02d}:{m:02d}"
 
-    emoji = "☀️" if is_daytime(tod) else "🌙"
-    return year, day_of_year, hhmm, emoji
+    return year, day, f"{h:02d}:{m:02d}"
 
 
-async def update_channel(force: bool = False):
-    """
-    Renames the voice channel, but throttles edits to avoid 429 rate limits.
-    """
+async def update_channel(force=False):
     global _last_name, _last_rename
 
     if REFERENCE_REAL_TIME is None:
         return
 
-    channel = bot.get_channel(VOICE_CHANNEL_ID)
-    if channel is None:
-        channel = await bot.fetch_channel(VOICE_CHANNEL_ID)
+    channel = bot.get_channel(VOICE_CHANNEL_ID) or await bot.fetch_channel(
+        VOICE_CHANNEL_ID
+    )
 
-    year, day, hhmm, emoji = get_state()
-    name = f"{emoji} Solunaris Year {year} | Day {day} | {hhmm}"
+    _, day, hhmm = get_state()
+    name = f"Solunaris | {hhmm} | Day {day}"
 
     now = time.time()
     if not force:
         if name == _last_name:
             return
-        if (now - _last_rename) < RENAME_INTERVAL_SECONDS:
+        if now - _last_rename < RENAME_INTERVAL_SECONDS:
             return
 
     await channel.edit(name=name)
@@ -182,66 +150,53 @@ async def update_channel(force: bool = False):
 
 @tasks.loop(seconds=CHECK_INTERVAL_SECONDS)
 async def clock_loop():
-    try:
-        await update_channel()
-    except Exception as e:
-        print(f"Loop error: {e}")
+    await update_channel()
 
 
 # ------------------ SLASH COMMANDS ------------------
-@bot.tree.command(name="day", description="Show the current Solunaris Year/Day/Time")
+@bot.tree.command(
+    name="day",
+    description="Show current Solunaris time",
+    guild=discord.Object(id=GUILD_ID),
+)
 async def day_slash(interaction: discord.Interaction):
     if REFERENCE_REAL_TIME is None:
         await interaction.response.send_message(
-            "⚠️ Not calibrated yet. Use `/calibrate` first.",
+            "Not calibrated yet. Ask an admin to run /calibrate.",
             ephemeral=True,
         )
         return
 
-    year, day, hhmm, emoji = get_state()
+    year, day, hhmm = get_state()
     await interaction.response.send_message(
-        f"{emoji} Solunaris Year {year} | Day {day} | {hhmm}"
+        f"Solunaris | {hhmm} | Day {day} (Year {year})"
     )
 
 
-@bot.tree.command(name="calibrate", description="Calibrate Solunaris day/time (Day is 1–365 rolling)")
-@app_commands.describe(
-    day="Day-of-year (1–365) used for year rolling",
-    time="In-game time (HH:MM)",
+@bot.tree.command(
+    name="calibrate",
+    description="ADMIN ONLY: Calibrate Solunaris time",
+    guild=discord.Object(id=GUILD_ID),
 )
+@app_commands.default_permissions(administrator=True)
+@app_commands.describe(day="Day (1–365)", time="Time HH:MM")
 async def calibrate_slash(interaction: discord.Interaction, day: int, time: str):
-    global CURRENT_YEAR
-    try:
-        hh, mm = parse_hhmm(time)
-        calibrate_state(day, hh, mm, CURRENT_YEAR)
-        await update_channel(force=True)
-        await interaction.response.send_message(
-            f"✅ Calibrated: Year {CURRENT_YEAR}, Day {day}, {hh:02d}:{mm:02d}"
-        )
-    except Exception as e:
-        await interaction.response.send_message(
-            f"❌ Calibration failed: {e}",
-            ephemeral=True,
-        )
+    h, m = parse_hhmm(time)
+    calibrate_state(day, h, m, CURRENT_YEAR)
+    await update_channel(force=True)
+    await interaction.response.send_message(
+        f"Calibrated → Solunaris | {h:02d}:{m:02d} | Day {day}"
+    )
 
 
 @bot.event
 async def on_ready():
-    loaded = load_state()
-    print(f"Logged in as {bot.user} | state_loaded={loaded}")
-
-    # Sync slash commands
-    try:
-        await bot.tree.sync()
-        print("Slash commands synced")
-    except Exception as e:
-        print(f"Slash command sync failed: {e}")
-
-    if loaded:
-        await update_channel(force=True)
-
-    if not clock_loop.is_running():
-        clock_loop.start()
+    load_state()
+    guild = discord.Object(id=GUILD_ID)
+    await bot.tree.sync(guild=guild)
+    await update_channel(force=True)
+    clock_loop.start()
+    print(f"Logged in as {bot.user}")
 
 
 bot.run(TOKEN)
