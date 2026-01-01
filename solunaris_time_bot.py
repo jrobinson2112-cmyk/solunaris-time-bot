@@ -17,7 +17,7 @@ TEXT_CHANNEL_ID = int(os.getenv("TEXT_CHANNEL_ID"))
 CALIBRATE_ROLE_ID = 1439069787207766076
 
 # Update interval
-UPDATE_INTERVAL = 300  # seconds
+UPDATE_INTERVAL = 120  # seconds
 
 # Measured conversion:
 # 20 in-game minutes = 94 real seconds => 1 in-game minute = 4.7 real seconds
@@ -83,7 +83,7 @@ def make_channel_name(day: int, hour: int, minute: int) -> str:
     # Discord sometimes strips leading emoji in some clients.
     # The zero-width space keeps it stable.
     # Also using the same "dot" style as Discord often uses: "・"
-    return f"\u200B{emoji} Solunaris Time | {hour:02d}:{minute:02d} | Day {day}"
+    return f"\u200B{emoji} Solunaris Time | {hour:02d}•{minute:02d} | Day {day}"
 
 
 async def update_text_channel_name():
