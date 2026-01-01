@@ -17,7 +17,7 @@ TEXT_CHANNEL_ID = int(os.getenv("TEXT_CHANNEL_ID"))
 CALIBRATE_ROLE_ID = 1439069787207766076
 
 # Update interval
-UPDATE_INTERVAL = 30  # seconds
+UPDATE_INTERVAL = 300  # seconds
 
 # Measured conversion:
 # 20 in-game minutes = 94 real seconds => 1 in-game minute = 4.7 real seconds
