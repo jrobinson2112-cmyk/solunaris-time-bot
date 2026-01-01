@@ -1,0 +1,97 @@
+import os
+import time
+import discord
+from discord.ext import commands, tasks
+from datetime import datetime
+from dotenv import load_dotenv
+
+load_dotenv()
+
+# ---- ENV ----
+TOKEN = os.getenv("DISCORD_TOKEN")
+VOICE_CHANNEL_ID = int(os.getenv("VOICE_CHANNEL_ID"))
+SOLUNARIS_YEAR = int(os.getenv("DEFAULT_YEAR", 1))
+
+# ---- TIME CONFIG ----
+# 1 in-game minute = 4 real seconds
+# 60 / 4 = 15 in-game seconds per real second
+ARK_SECONDS_PER_REAL_SECOND = 15.0
+ARK_DAY_SECONDS = 86400
+
+# ---- CALIBRATION (CURRENT GAME STATE) ----
+# RIGHT NOW (at deploy time):
+# Day 103 @ 06:05
+REFERENCE_REAL_TIME = time.time()
+
+REFERENCE_TOTAL_ARK_SECONDS = (
+    (103 - 1) * ARK_DAY_SECONDS +   # days before day 103
+    (5 * 3600) +                    # hours
+    (36 * 60)                       # minutes
+)
+
+# ---- DAY / NIGHT SPLIT ----
+DAY_START = int(5.5 * 3600)     # 05:30
+NIGHT_START = int(19.5 * 3600)  # 19:30
+
+intents = discord.Intents.default()
+intents.message_content = True
+bot = commands.Bot(command_prefix="!", intents=intents)
+
+_last_name = None
+
+def get_solunaris_state():
+    now = time.time()
+    real_elapsed = now - REFERENCE_REAL_TIME
+
+    total_ark_seconds = (
+        REFERENCE_TOTAL_ARK_SECONDS +
+        real_elapsed * ARK_SECONDS_PER_REAL_SECOND
+    )
+
+    ark_day = int(total_ark_seconds // ARK_DAY_SECONDS) + 1
+    tod = int(total_ark_seconds % ARK_DAY_SECONDS)
+
+    hours = tod // 3600
+    minutes = (tod % 3600) // 60
+
+    emoji = "☀️" if DAY_START <= tod < NIGHT_START else "🌙"
+    return ark_day, f"{hours:02d}:{minutes:02d}", emoji
+
+async def update_voice_channel(force=False):
+    global _last_name
+
+    channel = bot.get_channel(VOICE_CHANNEL_ID)
+    if channel is None:
+        channel = await bot.fetch_channel(VOICE_CHANNEL_ID)
+
+    ark_day, ark_time, emoji = get_solunaris_state()
+    new_name = f"{emoji} Solunaris Year {SOLUNARIS_YEAR} | Day {ark_day} | {ark_time}"
+
+    if force or new_name != _last_name:
+        await channel.edit(name=new_name)
+        _last_name = new_name
+
+# ---- FAST LOOP (smooth for 4s/min servers) ----
+@tasks.loop(seconds=2)
+async def solunaris_loop():
+    await update_voice_channel()
+
+@bot.command()
+async def setyear(ctx, year: int):
+    global SOLUNARIS_YEAR
+    SOLUNARIS_YEAR = year
+    await update_voice_channel(force=True)
+    await ctx.send(f"✅ Solunaris year set to {SOLUNARIS_YEAR}")
+
+@bot.command()
+async def solunaris(ctx):
+    ark_day, ark_time, emoji = get_solunaris_state()
+    await ctx.send(f"{emoji} Solunaris Year {SOLUNARIS_YEAR} | Day {ark_day} | {ark_time}")
+
+@bot.event
+async def on_ready():
+    print(f"Logged in as {bot.user}")
+    await update_voice_channel(force=True)
+    solunaris_loop.start()
+
+bot.run(TOKEN)
