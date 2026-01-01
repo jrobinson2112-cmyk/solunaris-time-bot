@@ -3,11 +3,17 @@
 # ✅ Voice channel name format:
 #    Solunaris | HH:MM | Day X
 #
-# ✅ Updates VC name safely every 60 seconds (avoids 429 rate limits)
+# ✅ Updates VC name safely every 60 seconds (avoid 429 rate limits)
 # ✅ Time conversion (measured): 20 in-game minutes = 94 real seconds
-# ✅ Slash commands (guild-scoped = instant):
+#
+# ✅ Slash commands (GUILD ONLY = instant):
 #    /day (everyone)
 #    /calibrate (ADMIN only)
+#
+# IMPORTANT:
+# - This file has ONE sync, ONCE, inside on_ready().
+# - It does NOT clear commands (you already ran the global clear tool).
+# - It does NOT sync global commands.
 #
 # REQUIRED Railway Variables:
 #   DISCORD_TOKEN
@@ -32,27 +38,28 @@ GUILD_OBJ = discord.Object(id=GUILD_ID)
 
 TOKEN = os.getenv("DISCORD_TOKEN")
 if not TOKEN:
-    raise RuntimeError("DISCORD_TOKEN is not set in Railway Variables")
+    raise RuntimeError("DISCORD_TOKEN is not set")
 
-_voice_id = os.getenv("VOICE_CHANNEL_ID")
-if not _voice_id:
-    raise RuntimeError("VOICE_CHANNEL_ID is not set in Railway Variables")
-VOICE_CHANNEL_ID = int(_voice_id)
+VOICE_CHANNEL_ID_RAW = os.getenv("VOICE_CHANNEL_ID")
+if not VOICE_CHANNEL_ID_RAW:
+    raise RuntimeError("VOICE_CHANNEL_ID is not set")
+VOICE_CHANNEL_ID = int(VOICE_CHANNEL_ID_RAW)
 
 DEFAULT_YEAR = int(os.getenv("DEFAULT_YEAR", "1"))
 
-DAYS_PER_YEAR = 365
-ARK_DAY_SECONDS = 86400
-
-# ✅ Measured conversion: 20 in-game minutes = 94 real seconds
-ARK_SECONDS_PER_REAL_SECOND = (20 * 60) / 94  # 12.7659574468
-
-# Rename cadence (safe)
-RENAME_INTERVAL_SECONDS = 60
-
 STATE_FILE = "solunaris_state.json"
 
-# No message content intent needed for slash commands
+# 1 in-game day = 24h = 86400 in-game seconds
+ARK_DAY_SECONDS = 86400
+DAYS_PER_YEAR = 365
+
+# ✅ Measured conversion: 20 in-game minutes (1200s) = 94 real seconds
+ARK_SECONDS_PER_REAL_SECOND = 1200 / 94  # 12.7659574468
+
+# Safe rename cadence to avoid 429
+RENAME_INTERVAL_SECONDS = 60
+
+# ------------------ DISCORD CLIENT ------------------
 intents = discord.Intents.default()
 client = discord.Client(intents=intents)
 tree = app_commands.CommandTree(client)
@@ -63,19 +70,19 @@ REF_YEAR = None              # year at calibration moment
 REF_DAY_OF_YEAR = None       # day (1..365) at calibration moment
 REF_TOD_SECONDS = None       # seconds into day at calibration moment
 
-_last_name = None
-_last_rename = 0.0
+_last_channel_name = None
+_last_rename_time = 0.0
 
 
 # ------------------ HELPERS ------------------
-def parse_hhmm(hhmm: str):
-    hhmm = hhmm.strip()
-    if ":" not in hhmm:
+def parse_hhmm(value: str) -> tuple[int, int]:
+    value = value.strip()
+    if ":" not in value:
         raise ValueError("Time must be HH:MM (example 14:28)")
-    h, m = hhmm.split(":", 1)
-    h, m = int(h), int(m)
+    h_str, m_str = value.split(":", 1)
+    h, m = int(h_str), int(m_str)
     if not (0 <= h <= 23 and 0 <= m <= 59):
-        raise ValueError("Invalid time. HH 0-23, MM 0-59.")
+        raise ValueError("Invalid time (HH 0–23, MM 0–59)")
     return h, m
 
 
@@ -88,7 +95,7 @@ def is_calibrated() -> bool:
     )
 
 
-def save_state():
+def save_state() -> None:
     with open(STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(
             {
@@ -116,7 +123,7 @@ def load_state() -> bool:
         return False
 
 
-def calibrate_state(day_of_year: int, hh: int, mm: int, year: int):
+def calibrate(day_of_year: int, hh: int, mm: int, year: int) -> None:
     global REFERENCE_REAL_TIME, REF_YEAR, REF_DAY_OF_YEAR, REF_TOD_SECONDS
     if not (1 <= day_of_year <= DAYS_PER_YEAR):
         raise ValueError("Day must be 1–365")
@@ -124,22 +131,22 @@ def calibrate_state(day_of_year: int, hh: int, mm: int, year: int):
     REFERENCE_REAL_TIME = time.time()
     REF_YEAR = year
     REF_DAY_OF_YEAR = day_of_year
-    REF_TOD_SECONDS = (hh * 3600) + (mm * 60)
+    REF_TOD_SECONDS = hh * 3600 + mm * 60
     save_state()
 
 
-def get_state():
+def current_solunaris() -> tuple[int, int, str]:
     """
-    Return (year, day_of_year, hhmm) computed from calibration + elapsed real time.
-    Day rolls every 24 in-game hours. Year increments after day 365.
+    Returns (year, day_of_year, hhmm) from the stored calibration and real elapsed time.
+    Year increments after day 365.
     """
     now = time.time()
     real_elapsed = now - REFERENCE_REAL_TIME
     ark_elapsed = real_elapsed * ARK_SECONDS_PER_REAL_SECOND
 
-    total_seconds = REF_TOD_SECONDS + ark_elapsed
-    days_passed = int(total_seconds // ARK_DAY_SECONDS)
-    tod = int(total_seconds % ARK_DAY_SECONDS)
+    total = REF_TOD_SECONDS + ark_elapsed
+    days_passed = int(total // ARK_DAY_SECONDS)
+    tod = int(total % ARK_DAY_SECONDS)
 
     day_of_year = REF_DAY_OF_YEAR + days_passed
     year = REF_YEAR
@@ -155,38 +162,38 @@ def get_state():
     return year, day_of_year, hhmm
 
 
-async def update_voice_channel(force: bool = False):
-    """Rename the voice channel (rate-limit safe)."""
-    global _last_name, _last_rename
+async def rename_voice_channel(force: bool = False) -> None:
+    global _last_channel_name, _last_rename_time
 
     if not is_calibrated():
         return
 
-    channel = client.get_channel(VOICE_CHANNEL_ID)
-    if channel is None:
-        channel = await client.fetch_channel(VOICE_CHANNEL_ID)
+    ch = client.get_channel(VOICE_CHANNEL_ID)
+    if ch is None:
+        ch = await client.fetch_channel(VOICE_CHANNEL_ID)
 
-    _, day, hhmm = get_state()
+    _, day, hhmm = current_solunaris()
     new_name = f"Solunaris | {hhmm} | Day {day}"
 
     now = time.time()
     if not force:
-        if new_name == _last_name:
+        if new_name == _last_channel_name:
             return
-        if (now - _last_rename) < RENAME_INTERVAL_SECONDS:
+        if (now - _last_rename_time) < RENAME_INTERVAL_SECONDS:
             return
 
-    await channel.edit(name=new_name)
-    _last_name = new_name
-    _last_rename = now
-    print(f"Updated VC → {new_name}", flush=True)
+    await ch.edit(name=new_name)
+    _last_channel_name = new_name
+    _last_rename_time = now
+    print(f"✅ Updated VC → {new_name}", flush=True)
 
 
+# ------------------ LOOP ------------------
 @tasks.loop(seconds=5)
-async def tick_loop():
-    # check frequently, but rename is throttled to 60s inside update_voice_channel()
+async def tick():
+    # check frequently; rename is throttled to 60s inside rename_voice_channel()
     try:
-        await update_voice_channel(force=False)
+        await rename_voice_channel(force=False)
     except Exception as e:
         print(f"Tick error: {e}", flush=True)
 
@@ -201,7 +208,7 @@ async def day_cmd(interaction: discord.Interaction):
         )
         return
 
-    year, day, hhmm = get_state()
+    year, day, hhmm = current_solunaris()
     await interaction.response.send_message(
         f"Solunaris | {hhmm} | Day {day} (Year {year})",
         ephemeral=False,
@@ -218,8 +225,8 @@ async def day_cmd(interaction: discord.Interaction):
 async def calibrate_cmd(interaction: discord.Interaction, day: int, time: str):
     try:
         hh, mm = parse_hhmm(time)
-        calibrate_state(day, hh, mm, DEFAULT_YEAR)
-        await update_voice_channel(force=True)
+        calibrate(day_of_year=day, hh=hh, mm=mm, year=DEFAULT_YEAR)
+        await rename_voice_channel(force=True)
         await interaction.response.send_message(
             f"✅ Calibrated → Solunaris | {hh:02d}:{mm:02d} | Day {day}",
             ephemeral=True,
@@ -231,25 +238,24 @@ async def calibrate_cmd(interaction: discord.Interaction, day: int, time: str):
         )
 
 
-# ------------------ EVENTS ------------------
+# ------------------ READY EVENT (ONE SYNC ONLY) ------------------
 @client.event
 async def on_ready():
     loaded = load_state()
     print(f"Logged in as {client.user} | state_loaded={loaded}", flush=True)
 
-    try:
-        # Sync guild commands (instant)
-        await tree.sync(guild=GUILD_OBJ)
-        cmds = [c.name for c in tree.get_commands(guild=GUILD_OBJ)]
-        print(f"✅ Guild commands synced: {cmds}", flush=True)
-    except Exception as e:
-        print(f"❌ Slash command sync failed: {e}", flush=True)
+    # ✅ ONE AND ONLY sync call — guild only
+    await tree.sync(guild=GUILD_OBJ)
+    print(
+        f"✅ Guild commands synced: {[c.name for c in tree.get_commands(guild=GUILD_OBJ)]}",
+        flush=True,
+    )
 
     if loaded:
-        await update_voice_channel(force=True)
+        await rename_voice_channel(force=True)
 
-    if not tick_loop.is_running():
-        tick_loop.start()
+    if not tick.is_running():
+        tick.start()
 
 
 client.run(TOKEN)
