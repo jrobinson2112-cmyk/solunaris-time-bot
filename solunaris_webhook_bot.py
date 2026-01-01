@@ -23,7 +23,8 @@ if not WEBHOOK_URL:
 
 CALIBRATE_ROLE_ID = 1439069787207766076
 
-UPDATE_INTERVAL = int(os.getenv("UPDATE_INTERVAL", "4.7"))  # seconds
+UPDATE_INTERVAL = float(os.getenv("UPDATE_INTERVAL", "4.7"))
+
 
 # Measured conversion:
 # 20 in-game minutes = 94 real seconds => 1 in-game minute = 4.7 real seconds
