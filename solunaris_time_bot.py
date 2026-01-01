@@ -227,7 +227,6 @@ async def on_ready():
     try:
         # ✅ Fix for "Application command not found":
         # clear old guild commands then re-sync
-        bot.tree.clear_commands(guild=guild)
         await bot.tree.sync(guild=guild)
         print("✅ Slash commands reset + synced to guild")
     except Exception as e:
