@@ -1,453 +1,222 @@
 import os
-import re
-import json
 import time
+import json
 import asyncio
-import socket
-from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
-
+import aiohttp
 import discord
 from discord import app_commands
-from discord.ext import tasks
 
-import requests
-from ftplib import FTP
+# =====================
+# ENV
+# =====================
+DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")
+PLAYERS_WEBHOOK_URL = os.getenv("PLAYERS_WEBHOOK_URL")
+NITRADO_TOKEN = os.getenv("NITRADO_TOKEN")
+NITRADO_SERVICE_ID = os.getenv("NITRADO_SERVICE_ID")
 
-STATE_FILE = "bot_state.json"
+if not all([DISCORD_TOKEN, WEBHOOK_URL, PLAYERS_WEBHOOK_URL, NITRADO_TOKEN, NITRADO_SERVICE_ID]):
+    raise RuntimeError("Missing required environment variables")
 
+# =====================
+# CONSTANTS
+# =====================
+GUILD_ID = 1430388266393276509
+ADMIN_ROLE_ID = 1439069787207766076
+STATUS_VC_ID = 1456615806887657606
+ANNOUNCE_CHANNEL_ID = 1430388267446042666
+PLAYER_CAP = 42
 
-# -----------------------------
-# Helpers / State
-# -----------------------------
-def load_state() -> dict:
-    if not os.path.exists(STATE_FILE):
-        return {}
-    try:
-        with open(STATE_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return {}
+DAY_SPM = 4.7666667
+NIGHT_SPM = 4.045
+SUNRISE = 5 * 60 + 30
+SUNSET = 17 * 60 + 30
 
+DAY_COLOR = 0xF1C40F
+NIGHT_COLOR = 0x5865F2
 
-def save_state(state: dict) -> None:
-    tmp = STATE_FILE + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(state, f, indent=2)
-    os.replace(tmp, STATE_FILE)
+STATE_FILE = "state.json"
 
-
-STATE = load_state()
-
-
-def env(name: str, default: Optional[str] = None) -> Optional[str]:
-    v = os.getenv(name)
-    return v if v not in (None, "") else default
-
-
-def must_env(name: str) -> str:
-    v = env(name)
-    if not v:
-        raise RuntimeError(f"Missing env var: {name}")
-    return v
-
-
-def now_ts() -> int:
-    return int(time.time())
-
-
-# -----------------------------
-# RCON (simple Source-style; works for many hosting panels)
-# If your ASA RCON differs, keep your existing working RCON bits
-# and just keep the parsing + bot logic below.
-# -----------------------------
-class SimpleRCON:
-    """
-    Minimal RCON client for "Source" style RCON.
-    If your current setup already runs ListPlayers via RCON successfully,
-    this should work.
-    """
-    SERVERDATA_AUTH = 3
-    SERVERDATA_AUTH_RESPONSE = 2
-    SERVERDATA_EXECCOMMAND = 2
-    SERVERDATA_RESPONSE_VALUE = 0
-
-    def __init__(self, host: str, port: int, password: str, timeout: float = 5.0):
-        self.host = host
-        self.port = port
-        self.password = password
-        self.timeout = timeout
-        self.sock: Optional[socket.socket] = None
-        self.req_id = 0
-
-    def _pack(self, req_id: int, req_type: int, body: str) -> bytes:
-        data = body.encode("utf-8") + b"\x00\x00"
-        size = 4 + 4 + len(data)
-        return size.to_bytes(4, "little", signed=True) + req_id.to_bytes(
-            4, "little", signed=True
-        ) + req_type.to_bytes(4, "little", signed=True) + data
-
-    def _recv_packet(self) -> Tuple[int, int, str]:
-        # read size
-        raw = self.sock.recv(4)
-        if len(raw) < 4:
-            raise ConnectionError("RCON: incomplete packet size")
-        size = int.from_bytes(raw, "little", signed=True)
-        payload = b""
-        while len(payload) < size:
-            chunk = self.sock.recv(size - len(payload))
-            if not chunk:
-                break
-            payload += chunk
-        if len(payload) < size:
-            raise ConnectionError("RCON: incomplete packet payload")
-
-        req_id = int.from_bytes(payload[0:4], "little", signed=True)
-        req_type = int.from_bytes(payload[4:8], "little", signed=True)
-        body = payload[8:-2].decode("utf-8", errors="replace")
-        return req_id, req_type, body
-
-    def connect(self) -> None:
-        self.sock = socket.create_connection((self.host, self.port), timeout=self.timeout)
-        self.sock.settimeout(self.timeout)
-
-        self.req_id += 1
-        self.sock.sendall(self._pack(self.req_id, self.SERVERDATA_AUTH, self.password))
-
-        # auth response often returns 2 packets; consume until we see auth response
-        authed = False
-        for _ in range(4):
-            rid, rtype, _ = self._recv_packet()
-            if rtype == self.SERVERDATA_AUTH_RESPONSE:
-                if rid == -1:
-                    raise PermissionError("RCON auth failed (bad password)")
-                authed = True
-                break
-        if not authed:
-            # some servers respond differently; if we're here, still try
-            pass
-
-    def close(self) -> None:
-        try:
-            if self.sock:
-                self.sock.close()
-        finally:
-            self.sock = None
-
-    def command(self, cmd: str) -> str:
-        if not self.sock:
-            self.connect()
-
-        self.req_id += 1
-        rid = self.req_id
-        self.sock.sendall(self._pack(rid, self.SERVERDATA_EXECCOMMAND, cmd))
-
-        # read until we get our response id (may be multiple chunks)
-        out = []
-        for _ in range(20):
-            pr_id, pr_type, body = self._recv_packet()
-            if pr_id == rid and pr_type in (self.SERVERDATA_RESPONSE_VALUE, self.SERVERDATA_AUTH_RESPONSE):
-                out.append(body)
-                # heuristic: empty body often indicates end
-                if body == "":
-                    break
-            else:
-                # ignore unrelated packets
-                pass
-        return "".join(out).strip()
-
-
-# -----------------------------
-# FTP Log Parsing (for character names + in-game time)
-# -----------------------------
-JOIN_RE = re.compile(r"^(?P<char>.+?) \[UniqueNetId:(?P<id>[0-9a-fA-F]+)\s+Platform:(?P<plat>[A-Z0-9]+)\] joined this ARK!")
-DAYTIME_RE = re.compile(r"Day\s+\d+,\s+\d{1,2}:\d{2}:\d{2}")
-
-@dataclass
-class PlayerEntry:
-    display: str          # platform name (gamertag/steam/psn)
-    unique_id: str        # EOS/UniqueNetId
-    character: Optional[str] = None
-
-
-class LogCache:
-    def __init__(self):
-        self.id_to_character: Dict[str, str] = {}
-        self.last_ingame_time: Optional[str] = None
-        self.last_sync_ts: int = 0
-
-    def update_from_log_text(self, log_text: str) -> None:
-        # build mapping from join lines
-        for line in log_text.splitlines():
-            m = JOIN_RE.search(line)
-            if m:
-                uid = m.group("id").lower()
-                char = m.group("char").strip()
-                # prefer latest
-                self.id_to_character[uid] = char
-
-        # find most recent "Day X, HH:MM:SS"
-        last = None
-        for line in reversed(log_text.splitlines()):
-            m = DAYTIME_RE.search(line)
-            if m:
-                last = m.group(0)
-                break
-        if last:
-            self.last_ingame_time = last
-
-        self.last_sync_ts = now_ts()
-
-
-LOGCACHE = LogCache()
-
-
-def fetch_log_via_ftp() -> str:
-    host = must_env("FTP_HOST")
-    port = int(env("FTP_PORT", "21"))
-    user = must_env("FTP_USER")
-    password = must_env("FTP_PASS")
-    path = env("FTP_LOG_PATH", "arksa/ShooterGame/Saved/Logs")
-    filename = env("FTP_LOG_FILE", "ShooterGame.log")
-
-    ftp = FTP()
-    ftp.connect(host, port, timeout=10)
-    ftp.login(user, password)
-
-    # Nitrado paths sometimes need stepping folder by folder
-    if path:
-        for part in path.split("/"):
-            if part:
-                ftp.cwd(part)
-
-    chunks: List[bytes] = []
-    ftp.retrbinary(f"RETR {filename}", chunks.append)
-    ftp.quit()
-
-    data = b"".join(chunks)
-    # log is usually UTF-8; fall back safely
-    return data.decode("utf-8", errors="replace")
-
-
-# -----------------------------
-# Webhook message (edit-only)
-# -----------------------------
-def ensure_webhook_message_id(webhook_url: str) -> str:
-    # stored per webhook URL so you can reuse code for multiple servers later
-    key = f"webhook_msg_id::{webhook_url}"
-    msg_id = STATE.get(key)
-    if msg_id:
-        return str(msg_id)
-
-    # Create one initial message, then store its id
-    resp = requests.post(webhook_url, json={"content": "", "embeds": [{
-        "title": "Online Players",
-        "description": "Initializing…",
-        "color": 0x2ECC71
-    }]}, timeout=10)
-
-    resp.raise_for_status()
-    data = resp.json()
-    new_id = str(data["id"])
-    STATE[key] = new_id
-    save_state(STATE)
-    return new_id
-
-
-def edit_webhook_message(webhook_url: str, message_id: str, embeds: list) -> None:
-    # Discord webhook edit endpoint:
-    # PATCH {webhook_url}/messages/{message_id}
-    url = webhook_url.rstrip("/") + f"/messages/{message_id}"
-    resp = requests.patch(url, json={"content": "", "embeds": embeds}, timeout=10)
-    resp.raise_for_status()
-
-
-# -----------------------------
-# Bot setup
-# -----------------------------
-INTENTS = discord.Intents.default()
-client = discord.Client(intents=INTENTS)
+# =====================
+# DISCORD SETUP
+# =====================
+intents = discord.Intents.default()
+client = discord.Client(intents=intents)
 tree = app_commands.CommandTree(client)
 
-DISCORD_TOKEN = must_env("DISCORD_TOKEN")
+# =====================
+# SHARED STATE
+# =====================
+message_ids = {
+    "time": None,
+    "players": None,
+}
 
-RCON_HOST = must_env("RCON_HOST")
-RCON_PORT = int(must_env("RCON_PORT"))
-RCON_PASSWORD = must_env("RCON_PASSWORD")
+last_announced_day = None
 
-PLAYERS_WEBHOOK_URL = must_env("PLAYERS_WEBHOOK_URL")
+# =====================
+# STATE FILE
+# =====================
+def load_state():
+    if not os.path.exists(STATE_FILE):
+        return None
+    with open(STATE_FILE, "r") as f:
+        return json.load(f)
 
-STATUS_CHANNEL_ID = int(env("STATUS_CHANNEL_ID", "0") or 0)
-ANNOUNCEMENT_CHANNEL_ID = int(env("ANNOUNCEMENT_CHANNEL_ID", "0") or 0)
+def save_state(s):
+    with open(STATE_FILE, "w") as f:
+        json.dump(s, f)
 
-# how often to refresh the online player message
-REFRESH_SECONDS = int(env("REFRESH_SECONDS", "60") or 60)
+state = load_state()
 
+# =====================
+# TIME LOGIC
+# =====================
+def is_day(minute):
+    return SUNRISE <= minute < SUNSET
 
-def rcon_list_players() -> str:
-    r = SimpleRCON(RCON_HOST, RCON_PORT, RCON_PASSWORD, timeout=8)
-    try:
-        return r.command("ListPlayers")
-    finally:
-        r.close()
+def spm(minute):
+    return DAY_SPM if is_day(minute) else NIGHT_SPM
 
+def calculate_time():
+    if not state:
+        return None
 
-def parse_listplayers(text: str) -> List[PlayerEntry]:
-    """
-    Example lines you showed:
-      0. kjrobinsonn, 0002027eea6e4d69bea553b53a343124
-    """
-    players: List[PlayerEntry] = []
-    for line in text.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        # accept either "0." or "01)" style
-        m = re.search(r"^\s*(?:\d+[\.\)]\s*)?([^,]+)\s*,\s*([0-9a-fA-F]{16,})\s*$", line)
-        if not m:
-            continue
-        display = m.group(1).strip()
-        uid = m.group(2).strip().lower()
-        players.append(PlayerEntry(display=display, unique_id=uid))
-    return players
+    elapsed = time.time() - state["epoch"]
+    minute_of_day = state["hour"] * 60 + state["minute"]
+    day = state["day"]
+    year = state["year"]
 
+    remaining = elapsed
+    while remaining > 0:
+        s = spm(minute_of_day)
+        remaining -= s
+        minute_of_day += 1
+        if minute_of_day >= 1440:
+            minute_of_day = 0
+            day += 1
+            if day > 365:
+                day = 1
+                year += 1
 
-def apply_character_names(players: List[PlayerEntry]) -> None:
-    for p in players:
-        p.character = LOGCACHE.id_to_character.get(p.unique_id)
+    hour = minute_of_day // 60
+    minute = minute_of_day % 60
+    emoji = "☀️" if is_day(minute_of_day) else "🌙"
+    color = DAY_COLOR if is_day(minute_of_day) else NIGHT_COLOR
 
+    title = f"{emoji} | Solunaris Time | {hour:02d}:{minute:02d} | Day {day} | Year {year}"
+    return title, color, year, day
 
-def build_players_embed(players: List[PlayerEntry], max_players: int = 42) -> list:
-    count = len(players)
-    title = "Online Players"
-    desc_lines = [f"**{count}/{max_players}** online"]
+# =====================
+# NITRADO STATUS
+# =====================
+async def get_server_status():
+    headers = {"Authorization": f"Bearer {NITRADO_TOKEN}"}
+    url = f"https://api.nitrado.net/services/{NITRADO_SERVICE_ID}/gameservers"
 
-    if count == 0:
-        desc_lines.append("\nNo one online.")
+    async with aiohttp.ClientSession() as session:
+        async with session.get(url, headers=headers) as r:
+            data = await r.json()
+
+    gs = data["data"]["gameserver"]
+    online = gs["status"] in ("started", "running", "online")
+    players = int(gs.get("query", {}).get("player_current", 0))
+    return online, players
+
+# =====================
+# WEBHOOK HELPER
+# =====================
+async def upsert_webhook(session, url, key, embed):
+    mid = message_ids[key]
+    if mid:
+        await session.patch(f"{url}/messages/{mid}", json={"embeds": [embed]})
     else:
-        desc_lines.append("")  # spacer
+        async with session.post(url + "?wait=true", json={"embeds": [embed]}) as r:
+            message_ids[key] = (await r.json())["id"]
 
-        # show character name if we have it, otherwise platform display
-        for i, p in enumerate(players, start=1):
-            name = p.character or p.display
-            desc_lines.append(f"{i:02d}) {name}")
+# =====================
+# LOOPS
+# =====================
+async def time_loop():
+    global last_announced_day
+    await client.wait_until_ready()
 
-    if LOGCACHE.last_ingame_time:
-        desc_lines.append("")
-        desc_lines.append(f"**In-game time:** {LOGCACHE.last_ingame_time}")
+    async with aiohttp.ClientSession() as session:
+        while True:
+            t = calculate_time()
+            if t:
+                title, color, year, day = t
+                embed = {"title": title, "color": color}
+                await upsert_webhook(session, WEBHOOK_URL, "time", embed)
 
-    embeds = [{
-        "title": title,
-        "description": "\n".join(desc_lines),
-        "color": 0x2ECC71,
-        "footer": {"text": f"Last update: <t:{now_ts()}:R>"}
-    }]
-    return embeds
+                absolute_day = year * 365 + day
+                if last_announced_day is None:
+                    last_announced_day = absolute_day
+                elif absolute_day > last_announced_day:
+                    ch = client.get_channel(ANNOUNCE_CHANNEL_ID)
+                    if ch:
+                        await ch.send(f"📅 **New Solunaris Day** — Day **{day}**, Year **{year}**")
+                    last_announced_day = absolute_day
 
+            await asyncio.sleep(DAY_SPM)
 
-async def refresh_players_webhook() -> None:
-    # update log cache occasionally so character mapping stays fresh
-    # (cheap guard to avoid hammering FTP every minute)
-    if now_ts() - LOGCACHE.last_sync_ts > 300:
-        try:
-            log_text = await asyncio.to_thread(fetch_log_via_ftp)
-            LOGCACHE.update_from_log_text(log_text)
-        except Exception:
-            # ignore; RCON list still works
-            pass
+async def status_loop():
+    await client.wait_until_ready()
+    async with aiohttp.ClientSession() as session:
+        while True:
+            online, players = await get_server_status()
+            emoji = "🟢" if online else "🔴"
 
-    raw = await asyncio.to_thread(rcon_list_players)
-    players = parse_listplayers(raw)
-    apply_character_names(players)
+            vc = client.get_channel(STATUS_VC_ID)
+            if vc:
+                await vc.edit(name=f"{emoji} Solunaris | {players}/{PLAYER_CAP}")
 
-    msg_id = ensure_webhook_message_id(PLAYERS_WEBHOOK_URL)
-    embeds = build_players_embed(players)
-    await asyncio.to_thread(edit_webhook_message, PLAYERS_WEBHOOK_URL, msg_id, embeds)
+            embed = {
+                "title": "Online Players",
+                "description": f"**{players}/{PLAYER_CAP}** online",
+                "color": 0x2ECC71 if online else 0xE74C3C,
+            }
+            await upsert_webhook(session, PLAYERS_WEBHOOK_URL, "players", embed)
 
+            await asyncio.sleep(15)
 
-@tasks.loop(seconds=REFRESH_SECONDS)
-async def players_loop():
-    try:
-        await refresh_players_webhook()
-    except Exception as e:
-        print(f"[players_loop] error: {e}")
+# =====================
+# COMMANDS
+# =====================
+@tree.command(name="settime", guild=discord.Object(id=GUILD_ID))
+async def settime(i: discord.Interaction, year: int, day: int, hour: int, minute: int):
+    if not any(r.id == ADMIN_ROLE_ID for r in i.user.roles):
+        await i.response.send_message("❌ No permission", ephemeral=True)
+        return
 
+    global state
+    state = {
+        "epoch": time.time(),
+        "year": year,
+        "day": day,
+        "hour": hour,
+        "minute": minute,
+    }
+    save_state(state)
+    await i.response.send_message("✅ Time set", ephemeral=True)
 
-# -----------------------------
-# Slash commands
-# -----------------------------
-@tree.command(name="status", description="Show server status and update the online players message.")
-async def status_cmd(interaction: discord.Interaction):
-    await interaction.response.defer(thinking=False, ephemeral=True)
+@tree.command(name="status", guild=discord.Object(id=GUILD_ID))
+async def status(i: discord.Interaction):
+    online, players = await get_server_status()
+    emoji = "🟢" if online else "🔴"
+    await i.response.send_message(
+        f"{emoji} **Solunaris** — {players}/{PLAYER_CAP} players",
+        ephemeral=True,
+    )
 
-    # force a webhook refresh and also sync log once (so names/time improves)
-    try:
-        try:
-            log_text = await asyncio.to_thread(fetch_log_via_ftp)
-            LOGCACHE.update_from_log_text(log_text)
-        except Exception:
-            pass
-
-        await refresh_players_webhook()
-
-        # Build a quick status message (simple: online if RCON responded)
-        ingame = LOGCACHE.last_ingame_time or "Unknown"
-        content = f"Server looks **online** (RCON OK)\nIn-game time: **{ingame}**"
-        await interaction.followup.send(content, ephemeral=True)
-
-        # Optional: also post a status message to your STATUS channel (if set)
-        if STATUS_CHANNEL_ID:
-            ch = client.get_channel(STATUS_CHANNEL_ID)
-            if isinstance(ch, discord.TextChannel):
-                await ch.send(f"Status update: Server **online** | In-game time: **{ingame}**")
-
-    except Exception as e:
-        await interaction.followup.send(f"Status check failed: `{e}`", ephemeral=True)
-
-
-@tree.command(name="synctime", description="Sync in-game time from Nitrado logs (FTP) and update the online players message.")
-async def synctime_cmd(interaction: discord.Interaction):
-    await interaction.response.defer(thinking=False, ephemeral=True)
-    try:
-        log_text = await asyncio.to_thread(fetch_log_via_ftp)
-        LOGCACHE.update_from_log_text(log_text)
-
-        # after syncing time, bump the players webhook so it shows new time too
-        await refresh_players_webhook()
-
-        if LOGCACHE.last_ingame_time:
-            await interaction.followup.send(
-                f"Synced in-game time: **{LOGCACHE.last_ingame_time}**",
-                ephemeral=True
-            )
-        else:
-            await interaction.followup.send(
-                "Synced logs, but couldn’t find a `Day X, HH:MM:SS` line yet.",
-                ephemeral=True
-            )
-    except Exception as e:
-        await interaction.followup.send(f"Synctime failed: `{e}`", ephemeral=True)
-
-
-# -----------------------------
-# Startup
-# -----------------------------
+# =====================
+# START
+# =====================
 @client.event
 async def on_ready():
-    print(f"Logged in as {client.user} (id={client.user.id})")
-    try:
-        synced = await tree.sync()
-        print(f"Synced {len(synced)} commands.")
-    except Exception as e:
-        print(f"Slash sync error: {e}")
+    await tree.sync(guild=discord.Object(id=GUILD_ID))
+    client.loop.create_task(time_loop())
+    client.loop.create_task(status_loop())
+    print("✅ Solunaris bot online")
 
-    if not players_loop.is_running():
-        players_loop.start()
-
-
-def main():
-    client.run(DISCORD_TOKEN)
-
-
-if __name__ == "__main__":
-    main()
+client.run(DISCORD_TOKEN)
