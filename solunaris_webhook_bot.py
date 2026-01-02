@@ -15,15 +15,20 @@ WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 GUILD_ID = 1430388266393276509
 ADMIN_ROLE_ID = 1439069787207766076
 
-# Day/night minute lengths
-DAY_SECONDS_PER_INGAME_MINUTE = 4.7666667
-NIGHT_SECONDS_PER_INGAME_MINUTE = 4.045  # as calculated previously
+# NEW: Channel to post "new day" messages into
+ANNOUNCE_CHANNEL_ID = int(os.getenv("ANNOUNCE_CHANNEL_ID", "0"))
+
+# Updated from your longer measurements:
+DAY_SECONDS_PER_INGAME_MINUTE = 4.7405
+NIGHT_SECONDS_PER_INGAME_MINUTE = 3.98
 
 STATE_FILE = "state.json"
 
-# Sunrise/sunset thresholds (in in-game minutes since midnight)
-SUNRISE_MIN = 6 * 60   # 06:00
-SUNSET_MIN  = 18 * 60  # 18:00
+# Updated day/night boundaries:
+# Day: 05:30 -> 17:30
+# Night: 17:30 -> 05:30
+SUNRISE_MIN = 5 * 60 + 30   # 05:30
+SUNSET_MIN  = 17 * 60 + 30  # 17:30
 
 DAY_COLOR = 0xF1C40F    # Yellow
 NIGHT_COLOR = 0x5865F2  # Blue
@@ -60,10 +65,8 @@ webhook_message_id = None
 def is_day_by_minute(minute_of_day: int) -> bool:
     return SUNRISE_MIN <= minute_of_day < SUNSET_MIN
 
-
 def seconds_per_minute_for(minute_of_day: int) -> float:
     return DAY_SECONDS_PER_INGAME_MINUTE if is_day_by_minute(minute_of_day) else NIGHT_SECONDS_PER_INGAME_MINUTE
-
 
 def advance_minutes_piecewise(start_day: int, start_minute_of_day: int, elapsed_real_seconds: float):
     """
@@ -75,7 +78,6 @@ def advance_minutes_piecewise(start_day: int, start_minute_of_day: int, elapsed_
     minute_of_day = float(start_minute_of_day)
     remaining = float(elapsed_real_seconds)
 
-    # Safety: stop any freak infinite loop if something goes wrong
     for _ in range(20000):
         if remaining <= 0:
             break
@@ -102,30 +104,26 @@ def advance_minutes_piecewise(start_day: int, start_minute_of_day: int, elapsed_
         seconds_to_boundary = minutes_until_boundary * spm
 
         if remaining >= seconds_to_boundary and seconds_to_boundary > 0:
-            # Jump exactly to boundary
             remaining -= seconds_to_boundary
             minute_of_day += minutes_until_boundary
         else:
-            # Advance partially
             add_minutes = remaining / spm if spm > 0 else 0
             minute_of_day += add_minutes
             remaining = 0
 
-        # Normalize day/minute_of_day
         while minute_of_day >= 1440:
             minute_of_day -= 1440
             day += 1
 
     return day, int(minute_of_day) % 1440
 
-
 def calculate_time():
     """
-    Returns (title, color, current_spm) using smooth piecewise conversion for day/night speed differences.
+    Returns (title, color, current_spm, day, year) using smooth piecewise conversion.
     Year rolls every 365 days.
     """
     if not state:
-        return None, None, None
+        return None, None, None, None, None
 
     elapsed_real = time.time() - state["real_epoch"]
 
@@ -133,7 +131,6 @@ def calculate_time():
     start_year = int(state["year"])
     start_minute_of_day = int(state["hour"]) * 60 + int(state["minute"])
 
-    # Advance with day/night piecewise conversion
     day, minute_of_day = advance_minutes_piecewise(start_day, start_minute_of_day, elapsed_real)
 
     # Year rolling: 365 days per year
@@ -151,17 +148,39 @@ def calculate_time():
 
     title = f"{emoji} | Solunaris Time | {hour:02d}:{minute:02d} | Day {day} | Year {year}"
     current_spm = DAY_SECONDS_PER_INGAME_MINUTE if day_now else NIGHT_SECONDS_PER_INGAME_MINUTE
-    return title, color, current_spm
+    return title, color, current_spm, day, year
 
 # =====================
-# WEBHOOK UPDATE LOOP (SCALES WITH DAY/NIGHT)
+# NEW DAY ANNOUNCEMENTS
+# =====================
+async def announce_new_day(day: int, year: int):
+    """
+    Posts a message in ANNOUNCE_CHANNEL_ID when a new day begins.
+    """
+    if ANNOUNCE_CHANNEL_ID == 0:
+        return  # not configured
+
+    channel = client.get_channel(ANNOUNCE_CHANNEL_ID)
+    if channel is None:
+        try:
+            channel = await client.fetch_channel(ANNOUNCE_CHANNEL_ID)
+        except Exception as e:
+            print(f"Could not fetch announce channel: {e}", flush=True)
+            return
+
+    # Simple message (you can customize)
+    await channel.send(f"🌅 **A new day begins in Solunaris!**  |  **Day {day}**  |  **Year {year}**")
+
+# =====================
+# WEBHOOK UPDATE LOOP (SCALES WITH DAY/NIGHT) + DAY CHANGE DETECTION
 # =====================
 async def update_loop():
     """
     Updates the webhook at:
-      - every 4.7666667 seconds during in-game day
-      - every 4.045 seconds during in-game night
-    and switches smoothly at sunrise/sunset.
+      - day: every 4.7405 seconds
+      - night: every 3.98 seconds
+    switches smoothly at sunrise/sunset,
+    AND posts a message when a new day starts.
     """
     global webhook_message_id
     await client.wait_until_ready()
@@ -169,8 +188,35 @@ async def update_loop():
     async with aiohttp.ClientSession() as session:
         while True:
             if state:
-                title, color, current_spm = calculate_time()
-                embed = {"title": title, "color": color}  # LARGE + BOLD + colored bar
+                title, color, current_spm, day, year = calculate_time()
+                if title is None:
+                    await asyncio.sleep(DAY_SECONDS_PER_INGAME_MINUTE)
+                    continue
+
+                # ---- Day change announcement ----
+                # We store last_announced_day + last_announced_year in state.
+                last_day = state.get("last_announced_day")
+                last_year = state.get("last_announced_year")
+
+                if last_day is None or last_year is None:
+                    # Initialize without announcing immediately
+                    state["last_announced_day"] = day
+                    state["last_announced_year"] = year
+                    save_state(state)
+                else:
+                    # If day/year changed -> announce once
+                    if int(day) != int(last_day) or int(year) != int(last_year):
+                        try:
+                            await announce_new_day(day, year)
+                        except Exception as e:
+                            print(f"Announce error: {e}", flush=True)
+
+                        state["last_announced_day"] = day
+                        state["last_announced_year"] = year
+                        save_state(state)
+
+                # ---- Webhook embed update (edit same message) ----
+                embed = {"title": title, "color": color}
 
                 if webhook_message_id:
                     await session.patch(
@@ -185,7 +231,6 @@ async def update_loop():
                         data = await resp.json()
                         webhook_message_id = data["id"]
 
-                # Sleep scales with the current day/night minute length
                 sleep_for = float(current_spm) if current_spm else DAY_SECONDS_PER_INGAME_MINUTE
             else:
                 sleep_for = DAY_SECONDS_PER_INGAME_MINUTE
@@ -200,14 +245,13 @@ async def update_loop():
     description="Show current Solunaris time",
     guild=discord.Object(id=GUILD_ID),
 )
-async def day(interaction: discord.Interaction):
+async def day_cmd(interaction: discord.Interaction):
     if not state:
         await interaction.response.send_message("⏳ Time not set yet.", ephemeral=True)
         return
 
-    title, _, _ = calculate_time()
+    title, _, _, _, _ = calculate_time()
     await interaction.response.send_message(title, ephemeral=True)
-
 
 @tree.command(
     name="settime",
@@ -236,6 +280,10 @@ async def settime(interaction: discord.Interaction, year: int, day: int, hour: i
         "day": day,
         "hour": hour,
         "minute": minute,
+
+        # reset announcement tracking on settime
+        "last_announced_day": day,
+        "last_announced_year": year,
     }
     save_state(state)
 
