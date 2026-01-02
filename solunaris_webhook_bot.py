@@ -3,48 +3,46 @@ import time
 import json
 import asyncio
 import aiohttp
-import socket
-import struct
 import discord
 from discord import app_commands
+import socket
+import struct
 
 # =====================
-# CONFIG (keep your vars)
+# ENV / CONFIG
 # =====================
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 
-RCON_HOST = os.getenv("RCON_HOST")  # e.g. 31.214.239.2
-RCON_PORT = int(os.getenv("RCON_PORT", "11020"))
-RCON_PASSWORD = os.getenv("RCON_PASSWORD")
+ARK_HOST = os.getenv("ARK_HOST", "31.214.239.2")
+ARK_QUERY_PORT = int(os.getenv("ARK_QUERY_PORT", "5020"))
+
+STATUS_VC_ID = int(os.getenv("STATUS_VC_ID", "0"))  # voice channel to rename for status (0 disables)
 
 GUILD_ID = 1430388266393276509
 ADMIN_ROLE_ID = 1439069787207766076
-
 PLAYER_CAP = 42
 
-# Time calibration
-DAY_SPM = 4.7666667
-NIGHT_SPM = 4.045
-
-# Day: 05:30–17:30, Night: 17:30–05:30
-SUNRISE = 5 * 60 + 30
-SUNSET = 17 * 60 + 30
-
-DAY_COLOR = 0xF1C40F
-NIGHT_COLOR = 0x5865F2
+# Smooth day/night minute lengths (real seconds per in-game minute)
+DAY_SECONDS_PER_INGAME_MINUTE = 4.7666667
+NIGHT_SECONDS_PER_INGAME_MINUTE = 4.045
 
 STATE_FILE = "state.json"
 
-# Put your status VC ID here
-STATUS_VC_ID = int(os.getenv("STATUS_VC_ID", "0"))
+# Day is 05:30 -> 17:30, Night is 17:30 -> 05:30
+SUNRISE_MIN = 5 * 60 + 30   # 05:30
+SUNSET_MIN  = 17 * 60 + 30  # 17:30
+
+DAY_COLOR = 0xF1C40F    # Yellow
+NIGHT_COLOR = 0x5865F2  # Blue
+
+# Status polling
+STATUS_POLL_SECONDS = 15            # check every 15s
+STATUS_FORCE_SECONDS = 10 * 60      # force update every 10 minutes
+STATUS_SOCKET_TIMEOUT = 1.5         # keep it short so commands don't hang
 
 if not DISCORD_TOKEN or not WEBHOOK_URL:
     raise RuntimeError("Missing DISCORD_TOKEN or WEBHOOK_URL")
-if not RCON_HOST or not RCON_PASSWORD:
-    raise RuntimeError("Missing RCON_HOST or RCON_PASSWORD")
-if STATUS_VC_ID == 0:
-    print("⚠️ STATUS_VC_ID not set; status VC renaming will be skipped.")
 
 # =====================
 # DISCORD SETUP
@@ -57,272 +55,296 @@ tree = app_commands.CommandTree(client)
 # STATE
 # =====================
 def load_state():
-    if os.path.exists(STATE_FILE):
-        with open(STATE_FILE, "r") as f:
-            return json.load(f)
-    return None
+    if not os.path.exists(STATE_FILE):
+        return None
+    with open(STATE_FILE, "r") as f:
+        return json.load(f)
 
-def save_state(s):
+def save_state(data):
     with open(STATE_FILE, "w") as f:
-        json.dump(s, f)
+        json.dump(data, f)
 
 state = load_state()
-webhook_msg_id = None
+webhook_message_id = None
 
 # =====================
-# TIME LOGIC
+# TIME CALCULATION (SMOOTH DAY/NIGHT)
 # =====================
-def is_day(minute_of_day: int) -> bool:
-    return SUNRISE <= minute_of_day < SUNSET
+def is_day_by_minute(minute_of_day: int) -> bool:
+    # day: [05:30, 17:30)
+    return SUNRISE_MIN <= minute_of_day < SUNSET_MIN
 
-def spm(minute_of_day: int) -> float:
-    return DAY_SPM if is_day(minute_of_day) else NIGHT_SPM
+def seconds_per_minute_for(minute_of_day: int) -> float:
+    return DAY_SECONDS_PER_INGAME_MINUTE if is_day_by_minute(minute_of_day) else NIGHT_SECONDS_PER_INGAME_MINUTE
 
-def advance_time(start_day: int, start_minute: int, elapsed_real_seconds: float):
-    # simple piecewise integration minute-by-minute fractionally
-    d = int(start_day)
-    m = float(start_minute)
+def advance_minutes_piecewise(start_day: int, start_minute_of_day: int, elapsed_real_seconds: float):
+    """
+    Advances in-game time using different real-seconds-per-in-game-minute for day vs night.
+    Smooth at sunrise/sunset by integrating across segments.
+    Returns (day, minute_of_day_int).
+    """
+    day = int(start_day)
+    minute_of_day = float(start_minute_of_day)  # 0..1439
     remaining = float(elapsed_real_seconds)
 
-    # loop in small chunks, but efficiently (jump by boundary)
+    # Prevent runaway loops
     for _ in range(20000):
         if remaining <= 0:
             break
 
-        minute_int = int(m) % 1440
-        current_spm = spm(minute_int)
+        current_minute_int = int(minute_of_day) % 1440
+        spm = seconds_per_minute_for(current_minute_int)
 
-        # determine next boundary minute
-        if is_day(minute_int):
-            boundary_total = (d - 1) * 1440 + SUNSET
+        # Determine next boundary (sunrise or sunset)
+        if is_day_by_minute(current_minute_int):
+            # next boundary is sunset today
+            boundary_total = (day - 1) * 1440 + SUNSET_MIN
         else:
-            if minute_int < SUNRISE:
-                boundary_total = (d - 1) * 1440 + SUNRISE
+            # night -> next boundary is sunrise (might be next day if after sunset)
+            if current_minute_int < SUNRISE_MIN:
+                boundary_total = (day - 1) * 1440 + SUNRISE_MIN
             else:
-                boundary_total = d * 1440 + SUNRISE  # next day sunrise
+                boundary_total = (day) * 1440 + SUNRISE_MIN  # next day sunrise
 
-        current_total = (d - 1) * 1440 + m
-        minutes_to_boundary = boundary_total - current_total
-        if minutes_to_boundary < 0:
-            minutes_to_boundary = 0
+        current_total = (day - 1) * 1440 + minute_of_day
+        minutes_until_boundary = boundary_total - current_total
+        if minutes_until_boundary < 0:
+            minutes_until_boundary = 0
 
-        seconds_to_boundary = minutes_to_boundary * current_spm
+        seconds_to_boundary = minutes_until_boundary * spm
 
         if seconds_to_boundary > 0 and remaining >= seconds_to_boundary:
             remaining -= seconds_to_boundary
-            m += minutes_to_boundary
+            minute_of_day += minutes_until_boundary
         else:
-            m += remaining / current_spm if current_spm > 0 else 0
+            add_minutes = remaining / spm if spm > 0 else 0
+            minute_of_day += add_minutes
             remaining = 0
 
-        while m >= 1440:
-            m -= 1440
-            d += 1
+        while minute_of_day >= 1440:
+            minute_of_day -= 1440
+            day += 1
 
-    return d, int(m) % 1440
+    return day, int(minute_of_day) % 1440
 
-def current_solunaris():
+def calculate_time():
+    """
+    Returns (title, color, current_spm, day_num, year_num, minute_of_day)
+    Year rolls every 365 days.
+    """
     if not state:
-        return None, None, None, None, None
+        return None
 
-    elapsed = time.time() - state["epoch"]
+    elapsed_real = time.time() - state["real_epoch"]
+
     start_day = int(state["day"])
     start_year = int(state["year"])
-    start_minute = int(state["minute"])
+    start_minute_of_day = int(state["hour"]) * 60 + int(state["minute"])
 
-    d, minute_of_day = advance_time(start_day, start_minute, elapsed)
+    day_num, minute_of_day = advance_minutes_piecewise(start_day, start_minute_of_day, elapsed_real)
 
-    y = start_year
-    while d > 365:
-        d -= 365
-        y += 1
+    # Year rolling: 365 days per year, calibrated from whatever day you set
+    year_num = start_year
+    while day_num > 365:
+        day_num -= 365
+        year_num += 1
 
-    hh = minute_of_day // 60
-    mm = minute_of_day % 60
-    day_now = is_day(minute_of_day)
+    hour = minute_of_day // 60
+    minute = minute_of_day % 60
+
+    day_now = is_day_by_minute(minute_of_day)
     emoji = "☀️" if day_now else "🌙"
     color = DAY_COLOR if day_now else NIGHT_COLOR
-    cur_spm = spm(minute_of_day)
 
-    title = f"{emoji} | **Solunaris Time** | **{hh:02d}:{mm:02d}** | Day {d} | Year {y}"
-    return title, color, cur_spm, d, y
-
-# =====================
-# RCON (NO EXTERNAL LIB)
-# Source RCON protocol: https://developer.valvesoftware.com/wiki/Source_RCON_Protocol
-# =====================
-SERVERDATA_AUTH = 3
-SERVERDATA_EXECCOMMAND = 2
-SERVERDATA_RESPONSE_VALUE = 0
-
-def _pkt(req_id: int, typ: int, body: str) -> bytes:
-    b = body.encode("utf-8") + b"\x00"
-    return struct.pack("<ii", req_id, typ) + b + b"\x00"
-
-def _read_packet(sock: socket.socket):
-    raw_len = sock.recv(4)
-    if len(raw_len) < 4:
-        return None
-    (length,) = struct.unpack("<i", raw_len)
-    data = b""
-    while len(data) < length:
-        chunk = sock.recv(length - len(data))
-        if not chunk:
-            break
-        data += chunk
-    if len(data) < 8:
-        return None
-    req_id, typ = struct.unpack("<ii", data[:8])
-    body = data[8:-2].decode("utf-8", errors="ignore")  # strip 2 nulls
-    return req_id, typ, body
-
-def rcon_command(host: str, port: int, password: str, command: str, timeout: float = 3.0) -> str:
-    req_id = int(time.time()) & 0x7FFFFFFF
-
-    with socket.create_connection((host, port), timeout=timeout) as s:
-        s.settimeout(timeout)
-
-        # AUTH
-        auth = _pkt(req_id, SERVERDATA_AUTH, password)
-        s.sendall(struct.pack("<i", len(auth)) + auth)
-
-        # read auth response(s)
-        authed = False
-        for _ in range(3):
-            pkt = _read_packet(s)
-            if not pkt:
-                continue
-            rid, typ, body = pkt
-            if typ == SERVERDATA_RESPONSE_VALUE or typ == SERVERDATA_AUTH:
-                if rid == -1:
-                    raise PermissionError("RCON auth failed")
-                if rid == req_id:
-                    authed = True
-                    break
-        if not authed:
-            raise TimeoutError("RCON auth timeout")
-
-        # COMMAND
-        cmd_id = req_id + 1
-        payload = _pkt(cmd_id, SERVERDATA_EXECCOMMAND, command)
-        s.sendall(struct.pack("<i", len(payload)) + payload)
-
-        # responses can be split; read until we get at least one response
-        out = []
-        for _ in range(10):
-            pkt = _read_packet(s)
-            if not pkt:
-                break
-            rid, typ, body = pkt
-            if rid == cmd_id and typ in (SERVERDATA_RESPONSE_VALUE,):
-                out.append(body)
-                # heuristic: if empty, might be terminator; otherwise continue once
-                if body == "":
-                    break
-        return "".join(out).strip()
-
-def get_server_status():
-    """
-    ONLINE if RCON reachable.
-    Players from ListPlayers (ARK).
-    """
-    try:
-        resp = rcon_command(RCON_HOST, RCON_PORT, RCON_PASSWORD, "ListPlayers", timeout=3.0)
-        # ARK often returns lines per player; sometimes header.
-        lines = [ln for ln in resp.splitlines() if ln.strip()]
-        # crude count: lines that look like a player entry
-        # if your output includes a header line, this still works well enough.
-        count = 0
-        for ln in lines:
-            # typical formats contain " - " or ":"; but safest is "contains a name"
-            if ln:
-                count += 1
-        return True, count
-    except PermissionError as e:
-        return True, None, f"RCON auth failed"
-    except Exception as e:
-        return False, None, f"{type(e).__name__}"
+    title = f"{emoji} | Solunaris Time | {hour:02d}:{minute:02d} | Day {day_num} | Year {year_num}"
+    current_spm = DAY_SECONDS_PER_INGAME_MINUTE if day_now else NIGHT_SECONDS_PER_INGAME_MINUTE
+    return title, color, current_spm, day_num, year_num, minute_of_day
 
 # =====================
-# WEBHOOK TIME LOOP
+# WEBHOOK: EDIT SAME MESSAGE
 # =====================
-async def time_loop():
-    global webhook_msg_id
+async def update_time_webhook_loop():
+    global webhook_message_id
     await client.wait_until_ready()
+
     async with aiohttp.ClientSession() as session:
         while True:
             if state:
-                title, color, wait, _, _ = current_solunaris()
-                embed = {"description": title, "color": color}
+                result = calculate_time()
+                if result:
+                    title, color, current_spm, *_ = result
 
-                try:
-                    if webhook_msg_id:
-                        r = await session.patch(
-                            f"{WEBHOOK_URL}/messages/{webhook_msg_id}",
-                            json={"embeds": [embed]},
-                        )
-                        # if message deleted => create a new one
-                        if r.status == 404:
-                            webhook_msg_id = None
-                    if not webhook_msg_id:
-                        async with session.post(WEBHOOK_URL + "?wait=true", json={"embeds": [embed]}) as resp:
-                            data = await resp.json()
-                            webhook_msg_id = data["id"]
-                except Exception as e:
-                    # don’t crash loop
-                    pass
+                    # Use embed description to look "bigger" than title; bold it too
+                    embed = {
+                        "color": color,
+                        "description": f"**{title}**"
+                    }
 
-                await asyncio.sleep(float(wait))
-            else:
-                await asyncio.sleep(5)
+                    try:
+                        if webhook_message_id:
+                            await session.patch(
+                                f"{WEBHOOK_URL}/messages/{webhook_message_id}",
+                                json={"embeds": [embed]},
+                            )
+                        else:
+                            async with session.post(
+                                WEBHOOK_URL + "?wait=true",
+                                json={"embeds": [embed]},
+                            ) as resp:
+                                data = await resp.json()
+                                webhook_message_id = data.get("id")
+                    except Exception as e:
+                        # If message was deleted or ID invalid, recreate it
+                        webhook_message_id = None
+                        print(f"[webhook] error, will recreate: {e}")
+
+                    await asyncio.sleep(float(current_spm))
+                    continue
+
+            await asyncio.sleep(DAY_SECONDS_PER_INGAME_MINUTE)
 
 # =====================
-# STATUS VC LOOP
+# ARK QUERY (UDP A2S_INFO) — in thread
 # =====================
-async def status_loop():
+def _a2s_info_query(host: str, port: int, timeout: float):
+    """
+    Source Engine A2S_INFO query.
+    Returns dict: {"online": bool, "players": int|None, "max_players": int|None, "error": str|None}
+    """
+    addr = (host, port)
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.settimeout(timeout)
+
+    # A2S_INFO request
+    packet = b"\xFF\xFF\xFF\xFFTSource Engine Query\x00"
+    try:
+        s.sendto(packet, addr)
+        data, _ = s.recvfrom(4096)
+
+        # Basic sanity
+        if len(data) < 6 or data[:4] != b"\xFF\xFF\xFF\xFF":
+            return {"online": True, "players": None, "max_players": None, "error": "bad response"}
+
+        # Handle split packets? (rare) — if so, just treat as online unknown.
+        header = data[4]
+        if header == 0x6C:  # 'l' split
+            return {"online": True, "players": None, "max_players": None, "error": "split response"}
+
+        if header != 0x49:  # 'I' A2S_INFO
+            return {"online": True, "players": None, "max_players": None, "error": f"unexpected header {header}"}
+
+        # Parse: https://developer.valvesoftware.com/wiki/Server_queries#A2S_INFO
+        # We only need players + max players; both are 1 byte near the end, but need to walk strings safely.
+        idx = 5  # after 0x49
+        idx += 1  # protocol byte
+
+        def read_cstring(buf, start):
+            end = buf.find(b"\x00", start)
+            if end == -1:
+                return None, start
+            return buf[start:end].decode("utf-8", "ignore"), end + 1
+
+        # name, map, folder, game
+        for _ in range(4):
+            _, idx = read_cstring(data, idx)
+        if idx + 2 > len(data):
+            return {"online": True, "players": None, "max_players": None, "error": "short data"}
+
+        idx += 2  # app id (short)
+
+        if idx + 3 > len(data):
+            return {"online": True, "players": None, "max_players": None, "error": "short data"}
+
+        players = data[idx]
+        max_players = data[idx + 1]
+        # bots = data[idx+2] (unused)
+
+        return {"online": True, "players": int(players), "max_players": int(max_players), "error": None}
+    except socket.timeout:
+        return {"online": False, "players": None, "max_players": None, "error": "TimeoutError"}
+    except Exception as e:
+        return {"online": False, "players": None, "max_players": None, "error": str(e)}
+    finally:
+        try:
+            s.close()
+        except Exception:
+            pass
+
+async def get_server_status():
+    # run blocking UDP query in a thread so slash commands don't timeout
+    return await asyncio.to_thread(_a2s_info_query, ARK_HOST, ARK_QUERY_PORT, STATUS_SOCKET_TIMEOUT)
+
+def format_status_text(st: dict):
+    online = st.get("online", False)
+    players = st.get("players", None)
+
+    dot = "🟢" if online else "🔴"
+    if players is None:
+        return f"{dot} Solunaris | Players: ?/{PLAYER_CAP}"
+    return f"{dot} Solunaris | Players: {players}/{PLAYER_CAP}"
+
+# =====================
+# STATUS VC UPDATER
+# =====================
+async def status_vc_loop():
     await client.wait_until_ready()
-    if STATUS_VC_ID == 0:
-        return
-
-    vc = client.get_channel(STATUS_VC_ID)
-    if vc is None:
-        print("⚠️ Could not find status VC by ID.")
+    if not STATUS_VC_ID:
+        print("ℹ️ STATUS_VC_ID not set; status VC updates disabled.")
         return
 
     last_name = None
-    last_force = 0
+    last_force = 0.0
 
     while True:
-        online, count, err = get_server_status()
+        try:
+            st = await get_server_status()
+            new_name = format_status_text(st)
 
-        if online:
-            if count is None:
-                name = f"🟡 Solunaris | ?/{PLAYER_CAP}"
-            else:
-                name = f"🟢 Solunaris | {count}/{PLAYER_CAP}"
-        else:
-            name = f"🔴 Solunaris | Offline"
+            force = (time.time() - last_force) >= STATUS_FORCE_SECONDS
+            changed = (new_name != last_name)
 
-        force = (time.time() - last_force) > 600  # 10 min
-        if name != last_name or force:
-            try:
-                await vc.edit(name=name)
-                last_name = name
+            if changed or force:
+                channel = client.get_channel(STATUS_VC_ID)
+                if channel is None:
+                    # fetch if not cached
+                    channel = await client.fetch_channel(STATUS_VC_ID)
+
+                # Only attempt if it supports edit
+                await channel.edit(name=new_name)
+                last_name = new_name
                 last_force = time.time()
-            except discord.HTTPException:
-                pass
 
-        await asyncio.sleep(15)
+        except Exception as e:
+            print(f"[status_vc] error: {e}")
+
+        await asyncio.sleep(STATUS_POLL_SECONDS)
 
 # =====================
 # SLASH COMMANDS
 # =====================
-@tree.command(name="day", description="Show current Solunaris time", guild=discord.Object(id=GUILD_ID))
+@tree.command(
+    name="day",
+    description="Show current Solunaris time",
+    guild=discord.Object(id=GUILD_ID),
+)
 async def day_cmd(interaction: discord.Interaction):
-    title, _, _, _, _ = current_solunaris()
-    await interaction.response.send_message(title or "⏳ Time not set yet.", ephemeral=True)
+    # respond fast
+    await interaction.response.defer(ephemeral=True)
 
-@tree.command(name="settime", description="Set Solunaris time", guild=discord.Object(id=GUILD_ID))
+    if not state:
+        await interaction.followup.send("⏳ Time not set yet.", ephemeral=True)
+        return
+
+    result = calculate_time()
+    title = result[0] if result else "⏳ Time not set yet."
+    await interaction.followup.send(title, ephemeral=True)
+
+
+@tree.command(
+    name="settime",
+    description="Set Solunaris time",
+    guild=discord.Object(id=GUILD_ID),
+)
 @app_commands.describe(
     year="Year number",
     day="Day of year (1–365)",
@@ -330,30 +352,50 @@ async def day_cmd(interaction: discord.Interaction):
     minute="Minute (0–59)",
 )
 async def settime_cmd(interaction: discord.Interaction, year: int, day: int, hour: int, minute: int):
-    if not any(r.id == ADMIN_ROLE_ID for r in interaction.user.roles):
-        await interaction.response.send_message("❌ You don’t have permission.", ephemeral=True)
+    await interaction.response.defer(ephemeral=True)
+
+    # Role-gated (not admin perm)
+    if not any(getattr(r, "id", None) == ADMIN_ROLE_ID for r in getattr(interaction.user, "roles", [])):
+        await interaction.followup.send("❌ You don't have the required role to use /settime.", ephemeral=True)
         return
 
-    if year < 1 or not (1 <= day <= 365) or not (0 <= hour <= 23) or not (0 <= minute <= 59):
-        await interaction.response.send_message("❌ Invalid values.", ephemeral=True)
+    if year < 1 or day < 1 or day > 365 or hour < 0 or hour > 23 or minute < 0 or minute > 59:
+        await interaction.followup.send("❌ Invalid values.", ephemeral=True)
         return
 
     global state
-    state = {"epoch": time.time(), "year": year, "day": day, "minute": hour * 60 + minute}
+    state = {
+        "real_epoch": time.time(),
+        "year": int(year),
+        "day": int(day),
+        "hour": int(hour),
+        "minute": int(minute),
+    }
     save_state(state)
-    await interaction.response.send_message(f"✅ Set to Day {day} {hour:02d}:{minute:02d} Year {year}", ephemeral=True)
 
-@tree.command(name="status", description="Show server status & players", guild=discord.Object(id=GUILD_ID))
+    await interaction.followup.send(
+        f"✅ Set to Day {day}, {hour:02d}:{minute:02d}, Year {year}",
+        ephemeral=True,
+    )
+
+
+@tree.command(
+    name="status",
+    description="Show Solunaris server status + players",
+    guild=discord.Object(id=GUILD_ID),
+)
 async def status_cmd(interaction: discord.Interaction):
-    online, count, err = get_server_status()
-    if online:
-        if count is None:
-            msg = f"🟡 **Solunaris is ONLINE** — Players: ?/{PLAYER_CAP} ({err})"
-        else:
-            msg = f"🟢 **Solunaris is ONLINE** — Players: {count}/{PLAYER_CAP}"
-    else:
-        msg = f"🔴 **Solunaris is OFFLINE** — Players: ?/{PLAYER_CAP} ({err})"
-    await interaction.response.send_message(msg, ephemeral=True)
+    # IMPORTANT: acknowledge instantly so it never times out
+    await interaction.response.defer(ephemeral=True)
+
+    st = await get_server_status()
+    msg = format_status_text(st)
+
+    # add error hint if query failed
+    if not st.get("online", False) and st.get("error"):
+        msg += f"\n(query failed: {st['error']})"
+
+    await interaction.followup.send(msg, ephemeral=True)
 
 # =====================
 # STARTUP
@@ -361,8 +403,9 @@ async def status_cmd(interaction: discord.Interaction):
 @client.event
 async def on_ready():
     await tree.sync(guild=discord.Object(id=GUILD_ID))
-    client.loop.create_task(time_loop())
-    client.loop.create_task(status_loop())
-    print("✅ Ready, commands synced")
+    print("✅ Commands synced")
+
+    client.loop.create_task(update_time_webhook_loop())
+    client.loop.create_task(status_vc_loop())
 
 client.run(DISCORD_TOKEN)
