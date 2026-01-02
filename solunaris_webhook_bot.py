@@ -110,10 +110,10 @@ def save_json(path: str, data):
 # Time calibration state
 state = load_json(STATE_FILE, None)
 
-# Webhook message ids
+# Webhook message ids (MUST be set via /initwebhooks)
 webhooks = load_json(WEBHOOKS_FILE, {"time_msg_id": None, "players_msg_id": None})
 
-# Mapping: EOS_ID -> {"char": "...", "platform": "..."}
+# Mapping: EOS_ID -> {"char": "..."}
 eos_map: Dict[str, Dict[str, str]] = load_json(MAP_FILE, {})
 
 # FTP cursor state
@@ -140,7 +140,6 @@ def advance_piecewise(start_day: int, start_minute: int, elapsed_seconds: float)
         m_int = int(minute) % 1440
         cur_spm = spm(m_int)
 
-        # next boundary
         if is_day(m_int):
             boundary_total = (day - 1) * 1440 + SUNSET_MIN
         else:
@@ -244,9 +243,8 @@ class RCONClient:
         rid = self._next_id()
         self._send(rid, SERVERDATA_AUTH, self.password)
 
-        # auth response may include extra packets
         authed = False
-        for _ in range(4):
+        for _ in range(5):
             rrid, rtype, _ = self._recv()
             if rtype == SERVERDATA_AUTH_RESPONSE:
                 authed = (rrid != -1)
@@ -283,7 +281,7 @@ class RCONClient:
 async def rcon_listplayers() -> List[Tuple[str, str]]:
     """
     Returns list of (platform_name, eos_id) from ListPlayers output.
-    Example line: "0. Name, 0002abcd..."
+    Example: "0. Name, 0002abcd..."
     """
     def _do():
         rc = RCONClient(RCON_HOST, RCON_PORT, RCON_PASSWORD, timeout=4.0)
@@ -301,45 +299,37 @@ async def rcon_listplayers() -> List[Tuple[str, str]]:
         s = line.strip()
         if not s:
             continue
-        # remove leading "0." / "0)"
         s = re.sub(r"^\s*\d+\s*[\.\)]\s*", "", s)
         if "," in s:
             left, right = s.split(",", 1)
             platform = left.strip()
-            eos = right.strip()
+            eos = right.strip().lower()
             if platform and eos:
                 out.append((platform, eos))
         else:
-            # no eos, just name
             out.append((s.strip(), ""))
     return out
 
 # =========================================================
-# FTP LOG MAPPING
+# FTP LOG MAPPING (learn EOS -> Character)
 # =========================================================
-
-# Try to capture both EOS id + character + platform from logs.
-# Your exact log wording may differ; this is best-effort and learns over time.
 EOS_RX = re.compile(r"\b[0-9a-f]{32}\b", re.IGNORECASE)
 
-# Candidate patterns (we store any char names we can find next to EOS ids)
 PATTERNS = [
-    # "... EOS: <id> ... Character: <char> ..."
     re.compile(r"(?P<eos>[0-9a-f]{32}).*?(?:Character|Survivor)\s*[:=]\s*(?P<char>[^,\n\r]+)", re.IGNORECASE),
-    # "... CharacterName=<char> ... <eosid> ..."
     re.compile(r"(?:CharacterName|SurvivorName)\s*[:=]\s*(?P<char>[^,\n\r]+).*?(?P<eos>[0-9a-f]{32})", re.IGNORECASE),
-    # "<char> ... <eosid>"
-    re.compile(r"(?P<char>[A-Za-z0-9 _'\-]{2,32}).*?(?P<eos>[0-9a-f]{32})", re.IGNORECASE),
 ]
 
-def ftp_get_latest_log(ftp: FTP) -> Optional[str]:
-    ftp.cwd(FTP_LOG_DIR)
-    files = ftp.nlst()
-    # prefer .log, else anything
-    logs = [f for f in files if f.lower().endswith(".log")]
-    return logs[-1] if logs else (files[-1] if files else None)
+def ftp_pick_latest_log() -> Optional[str]:
+    with FTP() as ftp:
+        ftp.connect(FTP_HOST, FTP_PORT, timeout=10)
+        ftp.login(FTP_USER, FTP_PASS)
+        ftp.cwd(FTP_LOG_DIR)
+        files = ftp.nlst()
+        logs = [f for f in files if f.lower().endswith(".log")]
+        return logs[-1] if logs else (files[-1] if files else None)
 
-def ftp_read_new_bytes(latest_file: str) -> bytes:
+def ftp_read_new_bytes(filename: str) -> bytes:
     global ftp_state
     with FTP() as ftp:
         ftp.connect(FTP_HOST, FTP_PORT, timeout=10)
@@ -347,16 +337,16 @@ def ftp_read_new_bytes(latest_file: str) -> bytes:
         ftp.cwd(FTP_LOG_DIR)
 
         try:
-            size = ftp.size(latest_file) or 0
+            size = ftp.size(filename) or 0
         except Exception:
             size = 0
 
         last_file = ftp_state.get("file")
         last_pos = int(ftp_state.get("pos", 0))
 
-        if last_file != latest_file or last_pos > size:
+        if last_file != filename or last_pos > size:
             last_pos = 0
-            ftp_state["file"] = latest_file
+            ftp_state["file"] = filename
             ftp_state["pos"] = 0
 
         if size <= last_pos:
@@ -367,35 +357,28 @@ def ftp_read_new_bytes(latest_file: str) -> bytes:
             chunks.append(data)
 
         ftp.sendcmd("TYPE I")
-        ftp.retrbinary(f"RETR {latest_file}", _cb, rest=last_pos)
+        ftp.retrbinary(f"RETR {filename}", _cb, rest=last_pos)
 
-        new_data = b"".join(chunks)
-        ftp_state["pos"] = last_pos + len(new_data)
-        return new_data
+        data = b"".join(chunks)
+        ftp_state["pos"] = last_pos + len(data)
+        return data
 
-def update_map_from_text(text: str):
+def update_map_from_log_text(text: str):
     global eos_map
     for line in text.splitlines():
         s = line.strip()
         if not s:
             continue
-
-        # find eos in line
-        eos_match = EOS_RX.search(s)
-        if not eos_match:
+        eos_m = EOS_RX.search(s)
+        if not eos_m:
             continue
-        eos = eos_match.group(0).lower()
+        eos = eos_m.group(0).lower()
 
-        # attempt to find character name near it
         char = None
         for rx in PATTERNS:
             m = rx.search(s)
-            if m:
-                eos2 = m.group("eos").lower() if "eos" in m.groupdict() else eos
-                if eos2 != eos:
-                    continue
+            if m and m.group("eos").lower() == eos:
                 c = (m.group("char") or "").strip()
-                # basic sanity
                 if 2 <= len(c) <= 32:
                     char = c
                     break
@@ -408,26 +391,16 @@ def update_map_from_text(text: str):
 async def ftp_loop():
     while True:
         try:
-            def _pick():
-                with FTP() as ftp:
-                    ftp.connect(FTP_HOST, FTP_PORT, timeout=10)
-                    ftp.login(FTP_USER, FTP_PASS)
-                    ftp.cwd(FTP_LOG_DIR)
-                    files = ftp.nlst()
-                    logs = [f for f in files if f.lower().endswith(".log")]
-                    return logs[-1] if logs else (files[-1] if files else None)
-
-            latest = await asyncio.to_thread(_pick)
+            latest = await asyncio.to_thread(ftp_pick_latest_log)
             if latest:
                 new_bytes = await asyncio.to_thread(ftp_read_new_bytes, latest)
                 if new_bytes:
                     txt = new_bytes.decode("utf-8", errors="ignore")
-                    update_map_from_text(txt)
+                    update_map_from_log_text(txt)
                     save_json(MAP_FILE, eos_map)
                     save_json(FTP_STATE_FILE, ftp_state)
         except Exception:
             pass
-
         await asyncio.sleep(FTP_SCAN_SECONDS)
 
 # =========================================================
@@ -450,20 +423,34 @@ async def nitrado_status(session: aiohttp.ClientSession) -> Tuple[bool, Optional
     return online, cur
 
 # =========================================================
-# WEBHOOK UPDATE HELPERS
+# WEBHOOK EDIT-ONLY HELPERS
 # =========================================================
-async def upsert_webhook_embed(session: aiohttp.ClientSession, webhook_url: str, msg_id: Optional[str], embed: dict) -> str:
-    if msg_id:
-        async with session.patch(f"{webhook_url}/messages/{msg_id}", json={"embeds": [embed]}) as r:
-            if r.status in (200, 204):
-                return msg_id
-            if r.status != 404:
-                # non-404 failure; still try create
-                pass
+async def webhook_edit_only(session: aiohttp.ClientSession, webhook_url: str, msg_id: Optional[str], embed: dict):
+    """
+    EDIT ONLY: never posts new messages.
+    """
+    if not msg_id:
+        raise RuntimeError("Webhook message id not set. Run /initwebhooks once.")
+    async with session.patch(f"{webhook_url}/messages/{msg_id}", json={"embeds": [embed]}, timeout=10) as r:
+        if r.status not in (200, 204):
+            txt = await r.text()
+            raise RuntimeError(f"Webhook edit failed {r.status}: {txt}")
 
-    async with session.post(webhook_url + "?wait=true", json={"embeds": [embed]}) as r:
-        data = await r.json()
-        return data["id"]
+def build_players_desc(rcon_players: List[Tuple[str, str]]) -> str:
+    lines = []
+    for i, (platform, eos) in enumerate(rcon_players, start=1):
+        eos_l = eos.lower() if eos else ""
+        char = eos_map.get(eos_l, {}).get("char")
+        if char:
+            lines.append(f"{i:02d}) {char} - {platform}")
+        else:
+            lines.append(f"{i:02d}) {platform}")
+    header = f"**Solunaris**\nPlayers: **{len(rcon_players)}/{PLAYER_CAP}**\n"
+    body = "\n".join(lines) if lines else "_No players online._"
+    desc = header + body
+    if len(desc) > 4000:
+        desc = header + "\n".join(lines[:120]) + "\n…"
+    return desc
 
 # =========================================================
 # LOOPS
@@ -478,22 +465,19 @@ async def time_loop():
                     title, color, cur_spm = out
                     embed = {"title": f"**{title}**", "color": color}
                     try:
-                        webhooks["time_msg_id"] = await upsert_webhook_embed(
-                            session, TIME_WEBHOOK_URL, webhooks.get("time_msg_id"), embed
-                        )
-                        save_json(WEBHOOKS_FILE, webhooks)
-                    except Exception:
-                        pass
+                        await webhook_edit_only(session, TIME_WEBHOOK_URL, webhooks.get("time_msg_id"), embed)
+                    except Exception as e:
+                        print(f"[time webhook] {e}")
                     await asyncio.sleep(float(cur_spm))
                     continue
             await asyncio.sleep(DAY_SECONDS_PER_INGAME_MINUTE)
 
-async def status_and_players_loop():
+async def status_players_loop():
     await client.wait_until_ready()
     guild = client.get_guild(GUILD_ID)
 
     last_status_key = None
-    last_players_text = None
+    last_players_desc = None
     last_force = 0.0
 
     async with aiohttp.ClientSession() as session:
@@ -501,27 +485,24 @@ async def status_and_players_loop():
             now = time.time()
             force = (now - last_force) >= FORCE_UPDATE_SECONDS
 
-            # status
+            # status via nitrado
             try:
                 online, api_count = await nitrado_status(session)
             except Exception:
                 online, api_count = False, None
 
-            # players from RCON
+            # players via RCON
             try:
                 rcon_players = await rcon_listplayers()
             except Exception:
                 rcon_players = []
 
-            # count
             count = api_count if isinstance(api_count, int) else len(rcon_players)
-
-            # rename status VC
             emoji = "🟢" if online else "🔴"
             vc_name = f"{emoji} Solunaris {count}/{PLAYER_CAP}"
-
             status_key = (online, count)
 
+            # rename VC only on change/force
             if guild:
                 ch = guild.get_channel(STATUS_VC_ID)
                 if ch and isinstance(ch, (discord.VoiceChannel, discord.StageChannel)):
@@ -531,39 +512,20 @@ async def status_and_players_loop():
                         except Exception:
                             pass
 
-            # build players list using mapping
-            lines = []
-            for i, (platform, eos) in enumerate(rcon_players, start=1):
-                eos_l = eos.lower() if eos else ""
-                char = eos_map.get(eos_l, {}).get("char")
-                if char:
-                    lines.append(f"{i:02d}) {char} - {platform}")
-                else:
-                    # fallback until mapping is learned
-                    lines.append(f"{i:02d}) {platform}")
-
-            header = f"**Solunaris**\nPlayers: **{len(rcon_players)}/{PLAYER_CAP}**\n"
-            body = "\n".join(lines) if lines else "_No players online._"
-            desc = header + body
-            if len(desc) > 4000:
-                desc = header + "\n".join(lines[:120]) + "\n…"
-
-            players_text = desc
-
-            if force or players_text != last_players_text:
+            # players embed
+            players_desc = build_players_desc(rcon_players)
+            if force or players_desc != last_players_desc:
                 embed = {
                     "title": "Online Players",
-                    "description": players_text,
-                    "color": 0x2ECC71 if online else 0xE74C3C,
+                    "description": players_desc,
+                    "color": 0x2ECC71 if online else 0xE74C3C
                 }
                 try:
-                    webhooks["players_msg_id"] = await upsert_webhook_embed(
-                        session, PLAYERS_WEBHOOK_URL, webhooks.get("players_msg_id"), embed
-                    )
-                    save_json(WEBHOOKS_FILE, webhooks)
-                except Exception:
-                    pass
-                last_players_text = players_text
+                    await webhook_edit_only(session, PLAYERS_WEBHOOK_URL, webhooks.get("players_msg_id"), embed)
+                except Exception as e:
+                    print(f"[players webhook] {e}")
+
+                last_players_desc = players_desc
 
             if force or status_key != last_status_key:
                 last_status_key = status_key
@@ -612,17 +574,84 @@ async def cmd_settime(interaction: discord.Interaction, year: int, day: int, hou
     save_json(STATE_FILE, state)
     await interaction.followup.send(f"✅ Set to Day {day}, {hour:02d}:{minute:02d}, Year {year}", ephemeral=True)
 
-@tree.command(name="status", description="Show Solunaris server status", guild=discord.Object(id=GUILD_ID))
-async def cmd_status(interaction: discord.Interaction):
-    await interaction.response.defer(ephemeral=True, thinking=True)
+@tree.command(name="initwebhooks", description="Create the initial webhook messages (run once)", guild=discord.Object(id=GUILD_ID))
+async def cmd_initwebhooks(interaction: discord.Interaction):
+    """
+    Because you want EDIT-ONLY, we store the initial message IDs once.
+    This command POSTS ONCE, then everything after is EDIT ONLY.
+    Admin role required.
+    """
+    await interaction.response.defer(ephemeral=True)
+    if not has_admin_role(interaction):
+        await interaction.followup.send("❌ No permission.", ephemeral=True)
+        return
+
     async with aiohttp.ClientSession() as session:
+        # Create time message
+        out = calc_time()
+        if out:
+            title, color, _ = out
+        else:
+            title, color = "☀️ | Solunaris Time | 00:00 | Day 1 | Year 1", DAY_COLOR
+
+        time_embed = {"title": f"**{title}**", "color": color}
+        async with session.post(TIME_WEBHOOK_URL + "?wait=true", json={"embeds": [time_embed]}) as r:
+            data = await r.json()
+            webhooks["time_msg_id"] = data["id"]
+
+        # Create players message
+        players_embed = {"title": "Online Players", "description": "**Solunaris**\nPlayers: **0/42**\n\n_No players online._", "color": 0x2ECC71}
+        async with session.post(PLAYERS_WEBHOOK_URL + "?wait=true", json={"embeds": [players_embed]}) as r:
+            data = await r.json()
+            webhooks["players_msg_id"] = data["id"]
+
+    save_json(WEBHOOKS_FILE, webhooks)
+    await interaction.followup.send("✅ Webhook message IDs saved. From now on: EDIT ONLY.", ephemeral=True)
+
+@tree.command(name="status", description="Show Solunaris server status + online players (and force update)", guild=discord.Object(id=GUILD_ID))
+async def cmd_status(interaction: discord.Interaction):
+    """
+    - Replies with status + players list
+    - Forces an immediate EDIT to the online-players webhook message (no new posts)
+    """
+    await interaction.response.defer(ephemeral=True, thinking=True)
+
+    async with aiohttp.ClientSession() as session:
+        # Status via nitrado
         try:
-            online, count = await nitrado_status(session)
+            online, api_count = await nitrado_status(session)
         except Exception:
-            online, count = False, None
-    emoji = "🟢" if online else "🔴"
-    txt = f"{emoji} Solunaris — Players: **{count if count is not None else '?'} / {PLAYER_CAP}**"
-    await interaction.followup.send(txt, ephemeral=True)
+            online, api_count = False, None
+
+        # Players via RCON
+        try:
+            rcon_players = await rcon_listplayers()
+        except Exception:
+            rcon_players = []
+
+        count = api_count if isinstance(api_count, int) else len(rcon_players)
+        emoji = "🟢" if online else "🔴"
+
+        players_desc = build_players_desc(rcon_players)
+
+        # Force webhook edit (no new message)
+        embed = {
+            "title": "Online Players",
+            "description": players_desc,
+            "color": 0x2ECC71 if online else 0xE74C3C
+        }
+        try:
+            await webhook_edit_only(session, PLAYERS_WEBHOOK_URL, webhooks.get("players_msg_id"), embed)
+        except Exception as e:
+            # still respond, but show why update didn't bump
+            await interaction.followup.send(f"{emoji} Solunaris — Players: **{count}/{PLAYER_CAP}**\n\n(⚠️ Could not edit players webhook: {e})", ephemeral=True)
+            return
+
+    # Respond with status + list
+    msg = f"{emoji} **Solunaris** — Players: **{count}/{PLAYER_CAP}**\n\n{players_desc}"
+    if len(msg) > 1800:
+        msg = msg[:1800] + "\n…"
+    await interaction.followup.send(msg, ephemeral=True)
 
 # =========================================================
 # STARTUP
@@ -630,10 +659,10 @@ async def cmd_status(interaction: discord.Interaction):
 @client.event
 async def on_ready():
     await tree.sync(guild=discord.Object(id=GUILD_ID))
-    print("✅ Commands synced")
+    print("✅ Commands synced: /day /settime /status /initwebhooks")
 
     client.loop.create_task(time_loop())
-    client.loop.create_task(status_and_players_loop())
+    client.loop.create_task(status_players_loop())
     client.loop.create_task(ftp_loop())
 
 client.run(DISCORD_TOKEN)
