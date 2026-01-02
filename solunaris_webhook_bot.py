@@ -250,8 +250,7 @@ def _rcon_listplayers(host: str, port: int, password: str, timeout: float):
                 out += body
                 # heuristic: if response ends with newline, we likely got it all
                 if out.endswith("\n") or len(out) > 5000:
-                    breakany:
-                    break
+    break
             except socket.timeout:
                 break
 
