@@ -17,12 +17,12 @@ GUILD_ID = int(os.getenv("GUILD_ID", "1430388266393276509"))
 ADMIN_ROLE_ID = int(os.getenv("ADMIN_ROLE_ID", "1439069787207766076"))
 
 # Optional channels
-DAY_ANNOUNCE_CHANNEL_ID = os.getenv("DAY_ANNOUNCE_CHANNEL_ID")  # optional
+DAY_ANNOUNCE_CHANNEL_ID = os.getenv("DAY_ANNOUNCE_CHANNEL_ID")  # optional (text channel)
 STATUS_VOICE_CHANNEL_ID = os.getenv("STATUS_VOICE_CHANNEL_ID")  # required for status VC
 
-# A2S (Steam query) - from your IP/port
+# A2S (Steam query) - your server
 A2S_HOST = os.getenv("A2S_HOST", "31.214.239.2")
-A2S_PORT = int(os.getenv("A2S_PORT", "5021"))  # Nitrado: game port + 1
+A2S_PORT = int(os.getenv("A2S_PORT", "5021"))  # Nitrado usually: game port + 1
 
 # Player cap (forced)
 PLAYER_CAP = int(os.getenv("PLAYER_CAP", "42"))
@@ -43,8 +43,18 @@ NIGHT_COLOR = 0x5865F2  # Blue
 
 STATE_FILE = "state.json"
 
-# Status VC refresh (keep slow-ish to avoid rate limits)
-STATUS_REFRESH_SECONDS = float(os.getenv("STATUS_REFRESH_SECONDS", "600"))  # 10 mins default
+# =====================
+# STATUS VC UPDATE POLICY (your new rules)
+# =====================
+# Check for changes every 15s (A2S query only; no Discord edit unless needed)
+STATUS_POLL_SECONDS = float(os.getenv("STATUS_POLL_SECONDS", "15"))
+
+# If changed, update immediately (edit VC name)
+# Even if not changed, force an update every 10 minutes
+STATUS_FORCE_UPDATE_SECONDS = float(os.getenv("STATUS_FORCE_UPDATE_SECONDS", "600"))
+
+# Safety minimum between VC edits to reduce 429 risk (edits are the expensive part)
+STATUS_MIN_SECONDS_BETWEEN_EDITS = float(os.getenv("STATUS_MIN_SECONDS_BETWEEN_EDITS", "120"))
 
 # =====================
 # BASIC VALIDATION
@@ -165,64 +175,75 @@ def calculate_time():
     return title, color, float(current_spm), int(day_num), int(year_num)
 
 # =====================
-# A2S QUERY (ONLINE + PLAYERS)
+# A2S QUERY (challenge-aware)
 # =====================
 A2S_INFO_REQUEST = b"\xFF\xFF\xFF\xFFTSource Engine Query\x00"
 
-def _read_cstring(data: bytes, idx: int):
-    end = data.find(b"\x00", idx)
-    if end == -1:
-        return "", idx
-    return data[idx:end].decode("utf-8", errors="replace"), end + 1
-
-async def a2s_query_players(host: str, port: int, timeout: float = 2.0):
+async def a2s_query_info(host: str, port: int, timeout: float = 2.0):
     """
-    Returns (online:bool, players:int).
+    Returns (online: bool, players: int, max_players: int)
+    Handles A2S challenge response (0x41).
     """
     loop = asyncio.get_running_loop()
 
-    def _do_query():
+    def _udp_exchange(payload: bytes) -> bytes:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.settimeout(timeout)
         try:
-            s.sendto(A2S_INFO_REQUEST, (host, port))
+            s.sendto(payload, (host, port))
             data, _ = s.recvfrom(4096)
             return data
         finally:
             s.close()
 
+    def _read_cstring(data: bytes, idx: int):
+        end = data.find(b"\x00", idx)
+        if end == -1:
+            return "", idx
+        return data[idx:end].decode("utf-8", errors="replace"), end + 1
+
     try:
-        data = await loop.run_in_executor(None, _do_query)
+        data = await loop.run_in_executor(None, _udp_exchange, A2S_INFO_REQUEST)
+
+        # Challenge?
+        if len(data) >= 9 and data[:4] == b"\xFF\xFF\xFF\xFF" and data[4] == 0x41:
+            challenge = data[5:9]
+            data = await loop.run_in_executor(None, _udp_exchange, A2S_INFO_REQUEST + challenge)
+
+        # Expect INFO response
+        if len(data) < 6 or data[:4] != b"\xFF\xFF\xFF\xFF" or data[4] != 0x49:
+            return False, 0, 0
+
+        idx = 5
+        idx += 1  # protocol
+
+        # name, map, folder, game
+        _, idx = _read_cstring(data, idx)
+        _, idx = _read_cstring(data, idx)
+        _, idx = _read_cstring(data, idx)
+        _, idx = _read_cstring(data, idx)
+
+        # app id
+        if idx + 2 > len(data):
+            return False, 0, 0
+        idx += 2
+
+        # players, max players, bots
+        if idx + 3 > len(data):
+            return False, 0, 0
+        players = data[idx]
+        max_players = data[idx + 1]
+
+        return True, int(players), int(max_players)
+
     except Exception:
-        return False, 0
-
-    if len(data) < 6 or data[:4] != b"\xFF\xFF\xFF\xFF" or data[4:5] != b"I":
-        return False, 0
-
-    idx = 5
-    idx += 1  # protocol
-
-    # name, map, folder, game
-    _, idx = _read_cstring(data, idx)
-    _, idx = _read_cstring(data, idx)
-    _, idx = _read_cstring(data, idx)
-    _, idx = _read_cstring(data, idx)
-
-    if idx + 2 > len(data):
-        return False, 0
-    idx += 2  # app id
-
-    if idx + 1 > len(data):
-        return False, 0
-
-    players = data[idx]
-    return True, int(players)
+        return False, 0, 0
 
 # =====================
 # LOOPS
 # =====================
 async def update_time_loop():
-    """Edits one webhook message, and optionally posts a message at each new day."""
+    """Edits one webhook message; optionally posts a message at each new day."""
     global webhook_message_id, state
     await client.wait_until_ready()
 
@@ -273,11 +294,16 @@ async def update_time_loop():
                 print(f"[webhook] {e}", flush=True)
                 webhook_message_id = None
 
+            # Keep your fast day/night ticking for the TIME embed
             await asyncio.sleep(float(current_spm) if current_spm else 5)
 
-
 async def update_status_vc_loop():
-    """Renames one voice channel to show server status and player count."""
+    """
+    Checks for status changes every 15s, but only edits the VC name if:
+      - status/name changed, OR
+      - 10 minutes have passed since last edit (forced refresh)
+    Also enforces a minimum delay between edits to reduce 429 risk.
+    """
     await client.wait_until_ready()
 
     if not STATUS_VOICE_CHANNEL_ID:
@@ -286,30 +312,44 @@ async def update_status_vc_loop():
 
     channel_id = int(STATUS_VOICE_CHANNEL_ID)
 
+    last_target_name = None
+    last_edit_ts = 0.0
+
     while True:
         try:
-            ch = client.get_channel(channel_id)
-            if ch is None:
-                ch = await client.fetch_channel(channel_id)
-
-            online, players = await a2s_query_players(A2S_HOST, A2S_PORT, timeout=2.0)
+            online, players, _max_players = await a2s_query_info(A2S_HOST, A2S_PORT, timeout=2.0)
 
             if online:
-                new_name = f"🟢 Solunaris | {players}/{PLAYER_CAP}"
+                target_name = f"🟢 Solunaris | {players}/{PLAYER_CAP}"
             else:
-                new_name = f"🔴 Solunaris | 0/{PLAYER_CAP}"
+                target_name = f"🔴 Solunaris | 0/{PLAYER_CAP}"
 
-            # Prevent unnecessary renames
-            if getattr(ch, "name", None) != new_name:
-                await ch.edit(name=new_name, reason="Solunaris server status update")
+            now = time.time()
+            changed = (target_name != last_target_name)
+            force_due = (now - last_edit_ts) >= STATUS_FORCE_UPDATE_SECONDS
+            can_edit = (now - last_edit_ts) >= STATUS_MIN_SECONDS_BETWEEN_EDITS
+
+            # Only edit if something changed OR we are due for forced refresh,
+            # and we haven't edited too recently.
+            if can_edit and (changed or force_due):
+                ch = client.get_channel(channel_id)
+                if ch is None:
+                    ch = await client.fetch_channel(channel_id)
+
+                # Avoid pointless API calls: if Discord already has the right name and we're not forcing,
+                # skip edit. If we're forcing, we still do it.
+                if force_due or getattr(ch, "name", None) != target_name:
+                    await ch.edit(name=target_name, reason="Solunaris server status update")
+
+                last_target_name = target_name
+                last_edit_ts = now
 
         except discord.Forbidden:
             print("❌ Missing permission: Manage Channels (for the status VC).", flush=True)
         except Exception as e:
             print(f"[status_vc] {e}", flush=True)
 
-        # VC renames are rate-limited -> keep this slow
-        await asyncio.sleep(max(300, STATUS_REFRESH_SECONDS))  # never faster than 5 minutes
+        await asyncio.sleep(STATUS_POLL_SECONDS)
 
 # =====================
 # SLASH COMMANDS
@@ -322,20 +362,17 @@ async def day_cmd(interaction: discord.Interaction):
     title, _, _, _, _ = calculate_time()
     await interaction.response.send_message(title, ephemeral=True)
 
-
 @tree.command(name="status", description="Show Solunaris server status and players", guild=discord.Object(id=GUILD_ID))
 async def status_cmd(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
 
-    online, players = await a2s_query_players(A2S_HOST, A2S_PORT, timeout=2.0)
-
+    online, players, _max_players = await a2s_query_info(A2S_HOST, A2S_PORT, timeout=2.0)
     if online:
         msg = f"🟢 **Solunaris is ONLINE** — Players: **{players}/{PLAYER_CAP}**"
     else:
         msg = f"🔴 **Solunaris is OFFLINE** — Players: **0/{PLAYER_CAP}**"
 
     await interaction.followup.send(msg, ephemeral=True)
-
 
 @tree.command(name="settime", description="Set Solunaris time (admin role only)", guild=discord.Object(id=GUILD_ID))
 @app_commands.describe(year="Year (>=1)", day="Day (1–365)", hour="Hour (0–23)", minute="Minute (0–59)")
@@ -356,7 +393,7 @@ async def settime_cmd(interaction: discord.Interaction, year: int, day: int, hou
         "day": day,
         "hour": hour,
         "minute": minute,
-        "last_announced_day_key": f"{year}-{day}",
+        "last_announced_day_key": f"{year}-{day}",  # prevents immediate "new day" post
     }
     save_state(state)
 
