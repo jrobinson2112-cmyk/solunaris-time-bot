@@ -20,25 +20,25 @@ ADMIN_ROLE_ID = int(os.getenv("ADMIN_ROLE_ID", "1439069787207766076"))
 DAY_ANNOUNCE_CHANNEL_ID = os.getenv("DAY_ANNOUNCE_CHANNEL_ID")  # optional (text channel)
 STATUS_VOICE_CHANNEL_ID = os.getenv("STATUS_VOICE_CHANNEL_ID")  # required for status VC
 
-# RCON (recommended for ASA/Nitrado)
+# RCON
 RCON_HOST = os.getenv("RCON_HOST", "31.214.239.2")
 RCON_PORT = int(os.getenv("RCON_PORT", "11020"))
 RCON_PASSWORD = os.getenv("RCON_PASSWORD", "").strip()
 
-# A2S (kept as optional fallback; may not work for ASA)
+# A2S fallback (often blocked for ASA; kept as last resort)
 A2S_HOST = os.getenv("A2S_HOST", "31.214.239.2")
 A2S_PORT = int(os.getenv("A2S_PORT", "5021"))
 
 PLAYER_CAP = int(os.getenv("PLAYER_CAP", "42"))
 
 # =====================
-# TIME / DAY-NIGHT CONFIG
+# TIME CONFIG
 # =====================
 DAY_SECONDS_PER_INGAME_MINUTE = 4.7405
 NIGHT_SECONDS_PER_INGAME_MINUTE = 3.98
 
-SUNRISE_MIN = 5 * 60 + 30   # 05:30
-SUNSET_MIN  = 17 * 60 + 30  # 17:30
+SUNRISE_MIN = 5 * 60 + 30
+SUNSET_MIN  = 17 * 60 + 30
 
 DAY_COLOR = 0xF1C40F
 NIGHT_COLOR = 0x5865F2
@@ -46,11 +46,11 @@ NIGHT_COLOR = 0x5865F2
 STATE_FILE = "state.json"
 
 # =====================
-# STATUS VC UPDATE POLICY
+# STATUS POLICY
 # =====================
 STATUS_POLL_SECONDS = float(os.getenv("STATUS_POLL_SECONDS", "15"))
-STATUS_FORCE_UPDATE_SECONDS = float(os.getenv("STATUS_FORCE_UPDATE_SECONDS", "600"))  # 10 mins
-STATUS_MIN_SECONDS_BETWEEN_EDITS = float(os.getenv("STATUS_MIN_SECONDS_BETWEEN_EDITS", "120"))  # safety
+STATUS_FORCE_UPDATE_SECONDS = float(os.getenv("STATUS_FORCE_UPDATE_SECONDS", "600"))
+STATUS_MIN_SECONDS_BETWEEN_EDITS = float(os.getenv("STATUS_MIN_SECONDS_BETWEEN_EDITS", "120"))
 
 # =====================
 # VALIDATION
@@ -68,7 +68,7 @@ client = discord.Client(intents=intents)
 tree = app_commands.CommandTree(client)
 
 # =====================
-# STATE STORAGE
+# STATE
 # =====================
 def load_state():
     if not os.path.exists(STATE_FILE):
@@ -84,7 +84,7 @@ state = load_state()
 webhook_message_id = None
 
 # =====================
-# TIME CALCULATION
+# TIME MATH
 # =====================
 def is_day_by_minute(minute_of_day: int) -> bool:
     return SUNRISE_MIN <= minute_of_day < SUNSET_MIN
@@ -155,22 +155,20 @@ def calculate_time():
     day_now = is_day_by_minute(minute_of_day)
     emoji = "☀️" if day_now else "🌙"
     color = DAY_COLOR if day_now else NIGHT_COLOR
-
     title = f"{emoji} | Solunaris Time | {hour:02d}:{minute:02d} | Day {day_num} | Year {year_num}"
+
     current_spm = DAY_SECONDS_PER_INGAME_MINUTE if day_now else NIGHT_SECONDS_PER_INGAME_MINUTE
     return title, color, float(current_spm), int(day_num), int(year_num)
 
 # =====================
-# RCON (Source RCON protocol)
+# RCON (robust status)
 # =====================
-# Packet types
 SERVERDATA_AUTH = 3
 SERVERDATA_EXECCOMMAND = 2
 
 def _rcon_packet(packet_id: int, ptype: int, body: str) -> bytes:
     body_bytes = body.encode("utf-8") + b"\x00"
-    empty = b"\x00"
-    payload = struct.pack("<ii", packet_id, ptype) + body_bytes + empty
+    payload = struct.pack("<ii", packet_id, ptype) + body_bytes + b"\x00"
     return struct.pack("<i", len(payload)) + payload
 
 def _rcon_read(sock: socket.socket):
@@ -187,146 +185,115 @@ def _rcon_read(sock: socket.socket):
     if len(data) < 8:
         return None
     packet_id, ptype = struct.unpack("<ii", data[:8])
-    body = data[8:-2].decode("utf-8", errors="replace")  # strip 2 nulls
+    body = data[8:-2].decode("utf-8", errors="replace")
     return packet_id, ptype, body
 
-async def rcon_list_players(host: str, port: int, password: str, timeout: float = 3.0):
+async def rcon_status(host: str, port: int, password: str, timeout: float = 3.0):
     """
-    Returns (online: bool, players: int).
-    Uses RCON auth + ListPlayers.
+    Returns a dict:
+      {
+        "reachable": bool,   # TCP connect worked
+        "authed": bool,      # RCON auth ok
+        "players": int|None  # None if unknown
+      }
     """
-    if not password:
-        return False, 0
-
     loop = asyncio.get_running_loop()
 
     def _do():
+        result = {"reachable": False, "authed": False, "players": None}
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             s.settimeout(timeout)
             s.connect((host, port))
+            result["reachable"] = True
 
             # AUTH
+            if not password:
+                s.close()
+                return result
+
             s.sendall(_rcon_packet(1, SERVERDATA_AUTH, password))
+
+            # Servers sometimes send an empty response first; read a couple
             resp = _rcon_read(s)
+            if resp and resp[0] == -1:
+                s.close()
+                return result  # auth failed
+
+            # If not auth reply, read one more
+            if resp and resp[1] != SERVERDATA_AUTH:
+                resp2 = _rcon_read(s)
+                if resp2 and resp2[0] == -1:
+                    s.close()
+                    return result
+                resp = resp2
+
             if not resp:
                 s.close()
-                return False, 0
+                return result
 
-            # Some servers send an empty response before auth reply
-            if resp[1] != SERVERDATA_AUTH:
-                resp = _rcon_read(s)
-                if not resp:
-                    s.close()
-                    return False, 0
-
-            packet_id, ptype, _body = resp
-            if packet_id == -1:
+            if resp[0] == -1:
                 s.close()
-                return False, 0  # auth failed
+                return result
 
-            # EXEC: ListPlayers
+            result["authed"] = True
+
+            # EXEC ListPlayers
             s.sendall(_rcon_packet(2, SERVERDATA_EXECCOMMAND, "ListPlayers"))
 
-            # Responses can arrive in multiple packets; read a couple
             bodies = []
-            for _ in range(4):
+            s.settimeout(0.6)
+            for _ in range(6):
                 r = _rcon_read(s)
                 if not r:
                     break
                 bodies.append(r[2])
-                # short wait to gather more data
-                s.settimeout(0.2)
 
             s.close()
 
             text = "\n".join(bodies).strip()
             if not text:
-                # Some servers return nothing but are still online
-                return True, 0
+                result["players"] = 0
+                return result
 
-            # Parse player count from output.
-            # Common ASA output includes one line per player.
             lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
-            # Filter out obvious headers
-            filtered = [ln for ln in lines if not ln.lower().startswith("players") and "steam" not in ln.lower()]
 
-            # If filtered becomes empty, fallback to counting non-empty lines
+            # Very simple heuristic: count non-header lines
+            filtered = []
+            for ln in lines:
+                low = ln.lower()
+                if low.startswith("players") or low.startswith("there are") or low.startswith("id") or low.startswith("name"):
+                    continue
+                filtered.append(ln)
+
             count = len(filtered) if filtered else len(lines)
-
-            # Very defensive: cap to PLAYER_CAP
-            return True, max(0, min(count, PLAYER_CAP))
+            result["players"] = max(0, min(count, PLAYER_CAP))
+            return result
 
         except Exception:
-            return False, 0
+            return result
 
     return await loop.run_in_executor(None, _do)
-
-# =====================
-# OPTIONAL A2S (fallback)
-# =====================
-A2S_INFO_REQUEST = b"\xFF\xFF\xFF\xFFTSource Engine Query\x00"
-
-async def a2s_query_info(host: str, port: int, timeout: float = 2.0):
-    loop = asyncio.get_running_loop()
-
-    def _udp_exchange(payload: bytes) -> bytes:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.settimeout(timeout)
-        try:
-            s.sendto(payload, (host, port))
-            data, _ = s.recvfrom(4096)
-            return data
-        finally:
-            s.close()
-
-    def _read_cstring(data: bytes, idx: int):
-        end = data.find(b"\x00", idx)
-        if end == -1:
-            return "", idx
-        return data[idx:end].decode("utf-8", errors="replace"), end + 1
-
-    try:
-        data = await loop.run_in_executor(None, _udp_exchange, A2S_INFO_REQUEST)
-        if len(data) >= 9 and data[:4] == b"\xFF\xFF\xFF\xFF" and data[4] == 0x41:
-            challenge = data[5:9]
-            data = await loop.run_in_executor(None, _udp_exchange, A2S_INFO_REQUEST + challenge)
-
-        if len(data) < 6 or data[:4] != b"\xFF\xFF\xFF\xFF" or data[4] != 0x49:
-            return False, 0
-
-        idx = 5 + 1
-        _, idx = _read_cstring(data, idx)
-        _, idx = _read_cstring(data, idx)
-        _, idx = _read_cstring(data, idx)
-        _, idx = _read_cstring(data, idx)
-
-        if idx + 3 > len(data):
-            return True, 0
-        idx += 2  # appid
-        players = data[idx]
-        return True, int(players)
-    except Exception:
-        return False, 0
 
 # =====================
 # STATUS SOURCE
 # =====================
 async def get_server_status():
     """
-    Primary: RCON (reliable for ASA/Nitrado)
-    Fallback: A2S
+    Prefer RCON:
+      - reachable+authed => ONLINE with players
+      - reachable but not authed => ONLINE but players unknown
+      - not reachable => OFFLINE
     """
-    online, players = await rcon_list_players(RCON_HOST, RCON_PORT, RCON_PASSWORD)
-    if online:
-        return True, players
+    rs = await rcon_status(RCON_HOST, RCON_PORT, RCON_PASSWORD)
 
-    # fallback only if RCON not configured or failed
-    online2, players2 = await a2s_query_info(A2S_HOST, A2S_PORT)
-    if online2:
-        return True, players2
+    if rs["reachable"]:
+        if rs["authed"] and rs["players"] is not None:
+            return "online", rs["players"]
+        # reachable but auth failed or no password => online, unknown players
+        return "unknown", None
 
-    return False, 0
+    return "offline", None
 
 # =====================
 # LOOPS
@@ -344,7 +311,6 @@ async def update_time_loop():
             title, color, current_spm, day_num, year_num = calculate_time()
             embed = {"title": title, "color": color}
 
-            # Optional day rollover post
             if DAY_ANNOUNCE_CHANNEL_ID:
                 current_key = f"{year_num}-{day_num}"
                 last_key = state.get("last_announced_day_key")
@@ -386,9 +352,13 @@ async def update_status_vc_loop():
 
     while True:
         try:
-            online, players = await get_server_status()
-            if online:
+            status, players = await get_server_status()
+
+            if status == "online":
                 target_name = f"🟢 Solunaris | {players}/{PLAYER_CAP}"
+            elif status == "unknown":
+                # Server reachable but can't read players (bad password / not enabled)
+                target_name = f"🟡 Solunaris | ?/{PLAYER_CAP}"
             else:
                 target_name = f"🔴 Solunaris | 0/{PLAYER_CAP}"
 
@@ -399,7 +369,6 @@ async def update_status_vc_loop():
 
             if can_edit and (changed or force_due):
                 ch = client.get_channel(channel_id) or await client.fetch_channel(channel_id)
-                # only edit if needed, unless forcing
                 if force_due or getattr(ch, "name", None) != target_name:
                     await ch.edit(name=target_name, reason="Solunaris server status update")
                 last_target_name = target_name
@@ -426,11 +395,15 @@ async def day_cmd(interaction: discord.Interaction):
 @tree.command(name="status", description="Show Solunaris server status and players", guild=discord.Object(id=GUILD_ID))
 async def status_cmd(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
-    online, players = await get_server_status()
-    if online:
+
+    status, players = await get_server_status()
+    if status == "online":
         msg = f"🟢 **Solunaris is ONLINE** — Players: **{players}/{PLAYER_CAP}**"
+    elif status == "unknown":
+        msg = f"🟡 **Solunaris is ONLINE** — Players: **?/{PLAYER_CAP}** (RCON auth not working)"
     else:
         msg = f"🔴 **Solunaris is OFFLINE** — Players: **0/{PLAYER_CAP}**"
+
     await interaction.followup.send(msg, ephemeral=True)
 
 @tree.command(name="settime", description="Set Solunaris time (admin role only)", guild=discord.Object(id=GUILD_ID))
@@ -464,9 +437,8 @@ async def on_ready():
     await tree.sync(guild=discord.Object(id=GUILD_ID))
     print("✅ Slash commands synced to guild")
     print(f"✅ Logged in as {client.user}")
-
     if not RCON_PASSWORD:
-        print("⚠️ RCON_PASSWORD not set. Status may still show offline if A2S is blocked.", flush=True)
+        print("⚠️ RCON_PASSWORD not set. Status will show 🟡 (online unknown) if reachable, or 🔴 if unreachable.", flush=True)
 
     client.loop.create_task(update_time_loop())
     client.loop.create_task(update_status_vc_loop())
