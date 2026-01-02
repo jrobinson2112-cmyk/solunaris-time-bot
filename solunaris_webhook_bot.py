@@ -102,7 +102,6 @@ def advance_minutes_piecewise(start_day: int, start_minute_of_day: int, elapsed_
         current_minute_int = int(minute_of_day) % 1440
         spm = seconds_per_minute_for(current_minute_int)
 
-        # Next boundary total minutes since day 1 midnight
         if is_day_by_minute(current_minute_int):
             boundary_total = (day - 1) * 1440 + SUNSET_MIN
         else:
@@ -242,7 +241,6 @@ async def update_time_loop():
                 last_key = state.get("last_announced_day_key")
 
                 if last_key is None:
-                    # initialize without announcing
                     state["last_announced_day_key"] = current_key
                     save_state(state)
                 elif last_key != current_key:
@@ -324,6 +322,21 @@ async def day_cmd(interaction: discord.Interaction):
     title, _, _, _, _ = calculate_time()
     await interaction.response.send_message(title, ephemeral=True)
 
+
+@tree.command(name="status", description="Show Solunaris server status and players", guild=discord.Object(id=GUILD_ID))
+async def status_cmd(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+
+    online, players = await a2s_query_players(A2S_HOST, A2S_PORT, timeout=2.0)
+
+    if online:
+        msg = f"🟢 **Solunaris is ONLINE** — Players: **{players}/{PLAYER_CAP}**"
+    else:
+        msg = f"🔴 **Solunaris is OFFLINE** — Players: **0/{PLAYER_CAP}**"
+
+    await interaction.followup.send(msg, ephemeral=True)
+
+
 @tree.command(name="settime", description="Set Solunaris time (admin role only)", guild=discord.Object(id=GUILD_ID))
 @app_commands.describe(year="Year (>=1)", day="Day (1–365)", hour="Hour (0–23)", minute="Minute (0–59)")
 async def settime_cmd(interaction: discord.Interaction, year: int, day: int, hour: int, minute: int):
@@ -343,7 +356,6 @@ async def settime_cmd(interaction: discord.Interaction, year: int, day: int, hou
         "day": day,
         "hour": hour,
         "minute": minute,
-        # reset announcement tracking so it doesn't instantly announce
         "last_announced_day_key": f"{year}-{day}",
     }
     save_state(state)
