@@ -74,6 +74,9 @@ VC_EDIT_MIN_SECONDS = 300  # 5 minutes
 _last_vc_edit_ts = 0.0
 _last_vc_name = None
 
+# Time webhook: only update on round 10 minutes (00,10,20,30,40,50)
+TIME_UPDATE_STEP_MINUTES = 10
+
 # =====================
 # DISCORD SETUP
 # =====================
@@ -114,41 +117,82 @@ def is_day(minute_of_day: int) -> bool:
 def spm(minute_of_day: int) -> float:
     return DAY_SPM if is_day(minute_of_day) else NIGHT_SPM
 
-def calculate_time():
+def _advance_one_minute(minute_of_day: int, day: int, year: int):
+    minute_of_day += 1
+    if minute_of_day >= 1440:
+        minute_of_day = 0
+        day += 1
+        if day > 365:
+            day = 1
+            year += 1
+    return minute_of_day, day, year
+
+def calculate_time_details():
     """
-    Calculates current in-game time based on the last set epoch and variable SPM for day/night.
-    Returns: (title, color, year, day)
+    Like calculate_time(), but also returns:
+      - minute_of_day (0..1439)
+      - seconds_into_current_minute (real seconds since current in-game minute started)
+      - current_minute_spm (real seconds per in-game minute for current minute)
     """
     if not state:
         return None
 
-    elapsed = time.time() - state["epoch"]
+    elapsed = float(time.time() - state["epoch"])
     minute_of_day = int(state["hour"]) * 60 + int(state["minute"])
     day = int(state["day"])
     year = int(state["year"])
 
-    remaining = float(elapsed)
+    remaining = elapsed
 
-    # Advance minute-by-minute with the correct day/night speed.
-    # NOTE: This is accurate but can be CPU-heavy if you set time long ago.
-    while remaining > 0:
-        s = spm(minute_of_day)
-        remaining -= s
-        minute_of_day += 1
-        if minute_of_day >= 1440:
-            minute_of_day = 0
-            day += 1
-            if day > 365:
-                day = 1
-                year += 1
+    # Move forward whole in-game minutes while we have enough real seconds.
+    while True:
+        cur_spm = spm(minute_of_day)
+        if remaining >= cur_spm:
+            remaining -= cur_spm
+            minute_of_day, day, year = _advance_one_minute(minute_of_day, day, year)
+            continue
+        # remaining is now "seconds into current in-game minute"
+        seconds_into_current_minute = remaining
+        return minute_of_day, day, year, seconds_into_current_minute, cur_spm
 
+def build_time_embed(minute_of_day: int, day: int, year: int):
     hour = minute_of_day // 60
     minute = minute_of_day % 60
     emoji = "☀️" if is_day(minute_of_day) else "🌙"
     color = DAY_COLOR if is_day(minute_of_day) else NIGHT_COLOR
-
     title = f"{emoji} | Solunaris Time | {hour:02d}:{minute:02d} | Day {day} | Year {year}"
-    return title, color, year, day
+    return {"title": title, "color": color}
+
+def seconds_until_next_round_step(minute_of_day: int, day: int, year: int, seconds_into_minute: float, step: int):
+    """
+    Returns real seconds until the next in-game minute where (minute % step == 0).
+    If currently exactly on a round step (minute%step==0), this schedules the NEXT one (step minutes ahead),
+    not "right now".
+    """
+    # How many minutes to add to land on the next boundary:
+    # If we're on a boundary already, wait step minutes.
+    m = minute_of_day
+    mod = m % step
+    minutes_to_boundary = (step - mod) if mod != 0 else step
+
+    # Time remaining in the current in-game minute (real seconds)
+    cur_spm = spm(m)
+    remaining_in_current_minute = max(0.0, cur_spm - seconds_into_minute)
+
+    # If boundary is in current minute (it isn't, because boundary is at minute transitions),
+    # we always need to finish current minute, then add more full minutes.
+    total = remaining_in_current_minute
+
+    # Add the full minutes between the next minute and the boundary minute
+    # Example: if minutes_to_boundary == 1, boundary happens at the *next* minute tick,
+    # so we add 0 full minutes here.
+    m2 = m
+    d2, y2 = day, year
+    for _ in range(minutes_to_boundary - 1):
+        m2, d2, y2 = _advance_one_minute(m2, d2, y2)
+        total += spm(m2)
+
+    return max(0.5, total)  # never spin too fast
 
 # =====================
 # NITRADO STATUS (COUNT)
@@ -163,7 +207,6 @@ async def get_server_status(session: aiohttp.ClientSession):
     gs = data["data"]["gameserver"]
     status = str(gs.get("status", "")).lower()
     online = status in ("started", "running", "online")
-
     players = int(gs.get("query", {}).get("player_current", 0) or 0)
     return online, players
 
@@ -182,15 +225,10 @@ def _rcon_make_packet(req_id: int, ptype: int, body: str) -> bytes:
     return size.to_bytes(4, "little", signed=True) + packet
 
 async def rcon_command(command: str, timeout: float = 5.0) -> str:
-    """
-    Minimal Source RCON client.
-    ptype: 3 = auth, 2 = exec command
-    """
     reader, writer = await asyncio.wait_for(
         asyncio.open_connection(RCON_HOST, RCON_PORT), timeout=timeout
     )
     try:
-        # auth
         writer.write(_rcon_make_packet(1, 3, RCON_PASSWORD))
         await writer.drain()
 
@@ -198,11 +236,9 @@ async def rcon_command(command: str, timeout: float = 5.0) -> str:
         if len(raw) < 12:
             raise RuntimeError("RCON auth failed (short response)")
 
-        # send command
         writer.write(_rcon_make_packet(2, 2, command))
         await writer.drain()
 
-        # read response (may come in multiple packets)
         chunks = []
         end_time = time.time() + timeout
         while time.time() < end_time:
@@ -218,8 +254,6 @@ async def rcon_command(command: str, timeout: float = 5.0) -> str:
             return ""
 
         data = b"".join(chunks)
-
-        # Parse packets: [size][id][type][body]\x00\x00
         out = []
         i = 0
         while i + 4 <= len(data):
@@ -229,8 +263,7 @@ async def rcon_command(command: str, timeout: float = 5.0) -> str:
                 break
             pkt = data[i:i+size]
             i += size
-
-            body = pkt[8:-2]  # skip id+type, strip trailing \x00\x00
+            body = pkt[8:-2]
             txt = body.decode("utf-8", errors="ignore")
             if txt:
                 out.append(txt)
@@ -244,12 +277,6 @@ async def rcon_command(command: str, timeout: float = 5.0) -> str:
             pass
 
 def parse_listplayers(output: str):
-    """
-    Parses ARK ListPlayers output.
-    Expected lines like:
-    0. Name, 0002xxxxxxxx...
-    Returns list[str] of player names only (no EOS IDs).
-    """
     players = []
     if not output:
         return players
@@ -289,11 +316,6 @@ async def upsert_webhook(session: aiohttp.ClientSession, url: str, key: str, emb
         message_ids[key] = data["id"]
 
 async def update_players_embed(session: aiohttp.ClientSession):
-    """
-    Updates the players webhook embed using RCON ListPlayers (names)
-    and Nitrado player count (fallback).
-    Returns: (emoji, count, online)
-    """
     online_nitrado, nitrado_count = await get_server_status(session)
 
     names = []
@@ -306,7 +328,6 @@ async def update_players_embed(session: aiohttp.ClientSession):
         rcon_ok = False
         rcon_err = str(e)
 
-    # Determine online best-effort
     online = online_nitrado or rcon_ok
     count = len(names) if names else nitrado_count
     emoji = "🟢" if online else "🔴"
@@ -340,10 +361,18 @@ async def time_loop():
 
     async with aiohttp.ClientSession() as session:
         while True:
-            t = calculate_time()
-            if t:
-                title, color, year, day = t
-                embed = {"title": title, "color": color}
+            details = calculate_time_details()
+
+            # If time hasn't been set yet, just wait a bit and try again
+            if not details:
+                await asyncio.sleep(5)
+                continue
+
+            minute_of_day, day, year, seconds_into_minute, cur_spm = details
+
+            # ONLY post time updates when the minute is a round 10 (00,10,20,30,40,50)
+            if (minute_of_day % TIME_UPDATE_STEP_MINUTES) == 0:
+                embed = build_time_embed(minute_of_day, day, year)
                 await upsert_webhook(session, WEBHOOK_URL, "time", embed)
 
                 absolute_day = year * 365 + day
@@ -355,8 +384,17 @@ async def time_loop():
                         await ch.send(f"📅 **New Solunaris Day** — Day **{day}**, Year **{year}**")
                     last_announced_day = absolute_day
 
-            # Keep your existing cadence (you can change this later)
-            await asyncio.sleep(DAY_SPM)
+                # We are on a boundary, so sleep until the NEXT boundary (10 minutes ahead in-game)
+                sleep_for = seconds_until_next_round_step(
+                    minute_of_day, day, year, seconds_into_minute, TIME_UPDATE_STEP_MINUTES
+                )
+                await asyncio.sleep(sleep_for)
+            else:
+                # Not on a boundary—sleep until the next boundary, then loop will post
+                sleep_for = seconds_until_next_round_step(
+                    minute_of_day, day, year, seconds_into_minute, TIME_UPDATE_STEP_MINUTES
+                )
+                await asyncio.sleep(sleep_for)
 
 async def status_loop():
     global _last_vc_edit_ts, _last_vc_name
@@ -366,20 +404,17 @@ async def status_loop():
         while True:
             emoji, count, online = await update_players_embed(session)
 
-            # ---- VC rename rate-limited to avoid Discord 429s ----
             vc = client.get_channel(STATUS_VC_ID)
             if vc:
                 new_name = f"{emoji} Solunaris | {count}/{PLAYER_CAP}"
                 now = time.time()
 
-                # Only edit if name changed AND we've waited long enough
                 if new_name != _last_vc_name and (now - _last_vc_edit_ts) >= VC_EDIT_MIN_SECONDS:
                     try:
                         await vc.edit(name=new_name)
                         _last_vc_name = new_name
                         _last_vc_edit_ts = now
                     except discord.HTTPException:
-                        # If Discord rate limits anyway, just try later
                         pass
 
             await asyncio.sleep(STATUS_POLL_SECONDS)
@@ -415,10 +450,7 @@ async def status(i: discord.Interaction):
     async with aiohttp.ClientSession() as session:
         emoji, count, online = await update_players_embed(session)
 
-    await i.followup.send(
-        f"{emoji} **Solunaris** — {count}/{PLAYER_CAP} players",
-        ephemeral=True,
-    )
+    await i.followup.send(f"{emoji} **Solunaris** — {count}/{PLAYER_CAP} players", ephemeral=True)
 
 # =====================
 # START
