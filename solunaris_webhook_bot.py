@@ -6,6 +6,7 @@ import aiohttp
 import discord
 from discord import app_commands
 import re
+from typing import Optional, Tuple
 
 # =====================
 # ENV
@@ -20,18 +21,30 @@ RCON_HOST = os.getenv("RCON_HOST")
 RCON_PORT = os.getenv("RCON_PORT")
 RCON_PASSWORD = os.getenv("RCON_PASSWORD")
 
-required_keys = [
-    "DISCORD_TOKEN",
-    "WEBHOOK_URL",
-    "PLAYERS_WEBHOOK_URL",
-    "NITRADO_TOKEN",
-    "NITRADO_SERVICE_ID",
-    "RCON_HOST",
-    "RCON_PORT",
-    "RCON_PASSWORD",
+required = [
+    DISCORD_TOKEN,
+    WEBHOOK_URL,
+    PLAYERS_WEBHOOK_URL,
+    NITRADO_TOKEN,
+    NITRADO_SERVICE_ID,
+    RCON_HOST,
+    RCON_PORT,
+    RCON_PASSWORD,
 ]
-missing = [k for k in required_keys if not os.getenv(k)]
-if missing:
+if not all(required):
+    missing = []
+    for k in [
+        "DISCORD_TOKEN",
+        "WEBHOOK_URL",
+        "PLAYERS_WEBHOOK_URL",
+        "NITRADO_TOKEN",
+        "NITRADO_SERVICE_ID",
+        "RCON_HOST",
+        "RCON_PORT",
+        "RCON_PASSWORD",
+    ]:
+        if not os.getenv(k):
+            missing.append(k)
     raise RuntimeError("Missing required environment variables: " + ", ".join(missing))
 
 RCON_PORT = int(RCON_PORT)
@@ -45,6 +58,7 @@ STATUS_VC_ID = 1456615806887657606
 ANNOUNCE_CHANNEL_ID = 1430388267446042666
 PLAYER_CAP = 42
 
+# Your current model (leave as-is)
 DAY_SPM = 4.7666667
 NIGHT_SPM = 4.045
 SUNRISE = 5 * 60 + 30
@@ -72,10 +86,6 @@ TIME_UPDATE_STEP_MINUTES = 10
 GAMELOG_SYNC_SECONDS = 120          # how often to check GetGameLog
 SYNC_DRIFT_MINUTES = 2              # only correct if drift >= this many in-game minutes
 SYNC_COOLDOWN_SECONDS = 600         # don't resync more than once per 10 minutes
-
-# IMPORTANT: ASA requires GetGameLog PAGE INDEX (e.g. "GetGameLog 1")
-GAMELOG_PAGE = 1                    # page 1 = newest
-GAMELOG_PAGES_TO_SCAN = 3           # scan newest..older pages for a Day/time line
 
 # =====================
 # DISCORD SETUP
@@ -130,10 +140,11 @@ def _advance_one_minute(minute_of_day: int, day: int, year: int):
 def calculate_time_details():
     """
     Returns:
-      - minute_of_day (0..1439)
-      - day, year
-      - seconds_into_current_minute (real seconds since current in-game minute started)
-      - current_minute_spm (real seconds per in-game minute for current minute)
+      minute_of_day (0..1439),
+      day,
+      year,
+      seconds_into_current_minute (real seconds),
+      current_minute_spm (real seconds per in-game minute)
     """
     if not state:
         return None
@@ -151,7 +162,6 @@ def calculate_time_details():
             remaining -= cur_spm
             minute_of_day, day, year = _advance_one_minute(minute_of_day, day, year)
             continue
-
         seconds_into_current_minute = remaining
         return minute_of_day, day, year, seconds_into_current_minute, cur_spm
 
@@ -164,10 +174,6 @@ def build_time_embed(minute_of_day: int, day: int, year: int):
     return {"title": title, "color": color}
 
 def seconds_until_next_round_step(minute_of_day: int, day: int, year: int, seconds_into_minute: float, step: int):
-    """
-    Real seconds until next in-game minute boundary where (minute % step == 0).
-    If currently exactly on a boundary, waits step minutes ahead (not immediately).
-    """
     m = minute_of_day
     mod = m % step
     minutes_to_boundary = (step - mod) if mod != 0 else step
@@ -201,66 +207,113 @@ async def get_server_status(session: aiohttp.ClientSession):
     return online, players
 
 # =====================
-# RCON (Minimal Source RCON)
+# RCON (robust)
 # =====================
-def _rcon_make_packet(req_id: int, ptype: int, body: str) -> bytes:
-    data = body.encode("utf-8") + b"\x00"
-    packet = (
-        req_id.to_bytes(4, "little", signed=True)
-        + ptype.to_bytes(4, "little", signed=True)
-        + data
-        + b"\x00"
-    )
-    size = len(packet)
-    return size.to_bytes(4, "little", signed=True) + packet
+SERVERDATA_AUTH = 3
+SERVERDATA_AUTH_RESPONSE = 2
+SERVERDATA_EXECCOMMAND = 2
+SERVERDATA_RESPONSE_VALUE = 0
 
-async def rcon_command(command: str, timeout: float = 6.0) -> str:
-    reader, writer = await asyncio.wait_for(
-        asyncio.open_connection(RCON_HOST, RCON_PORT), timeout=timeout
+def _rcon_packet(req_id: int, ptype: int, body: bytes) -> bytes:
+    # body must already be bytes (we control encoding upstream)
+    payload = (
+        req_id.to_bytes(4, "little", signed=True) +
+        ptype.to_bytes(4, "little", signed=True) +
+        body + b"\x00" + b"\x00"
     )
+    size = len(payload)
+    return size.to_bytes(4, "little", signed=True) + payload
+
+def _decode_rcon_text(b: bytes) -> str:
+    # Try to preserve special characters better than utf-8 ignore
+    for enc in ("utf-8", "cp1252", "latin-1"):
+        try:
+            return b.decode(enc)
+        except Exception:
+            continue
+    return b.decode("utf-8", errors="replace")
+
+async def _rcon_read_packet(reader: asyncio.StreamReader, timeout: float) -> Optional[Tuple[int, int, bytes]]:
+    # Returns (req_id, ptype, body_bytes) or None
     try:
-        # auth
-        writer.write(_rcon_make_packet(1, 3, RCON_PASSWORD))
+        size_b = await asyncio.wait_for(reader.readexactly(4), timeout=timeout)
+    except Exception:
+        return None
+
+    size = int.from_bytes(size_b, "little", signed=True)
+    if size < 10 or size > 10_000_000:
+        return None
+
+    try:
+        pkt = await asyncio.wait_for(reader.readexactly(size), timeout=timeout)
+    except Exception:
+        return None
+
+    req_id = int.from_bytes(pkt[0:4], "little", signed=True)
+    ptype = int.from_bytes(pkt[4:8], "little", signed=True)
+    body = pkt[8:-2]  # strip 2 nulls
+    return req_id, ptype, body
+
+async def rcon_command(command: str, timeout: float = 10.0) -> str:
+    """
+    Reliable Source RCON:
+    - Auth
+    - Exec command
+    - Send an empty exec as terminator
+    - Read packets until we see terminator response or timeout
+    """
+    reader, writer = await asyncio.wait_for(asyncio.open_connection(RCON_HOST, RCON_PORT), timeout=timeout)
+    try:
+        # AUTH
+        writer.write(_rcon_packet(1, SERVERDATA_AUTH, RCON_PASSWORD.encode("utf-8")))
         await writer.drain()
 
-        raw = await asyncio.wait_for(reader.read(4096), timeout=timeout)
-        if len(raw) < 12:
-            raise RuntimeError("RCON auth failed (short response)")
+        auth_ok = False
+        auth_deadline = time.time() + timeout
+        while time.time() < auth_deadline:
+            pkt = await _rcon_read_packet(reader, timeout=timeout)
+            if not pkt:
+                break
+            req_id, ptype, body = pkt
+            if ptype == SERVERDATA_AUTH_RESPONSE:
+                if req_id == -1:
+                    raise RuntimeError("RCON auth failed")
+                auth_ok = True
+                break
+        if not auth_ok:
+            raise RuntimeError("RCON auth: no response")
 
-        # command
-        writer.write(_rcon_make_packet(2, 2, command))
+        # EXEC
+        writer.write(_rcon_packet(2, SERVERDATA_EXECCOMMAND, command.encode("utf-8")))
         await writer.drain()
 
-        chunks = []
-        end_time = time.time() + timeout
-        while time.time() < end_time:
-            try:
-                part = await asyncio.wait_for(reader.read(4096), timeout=0.4)
-            except asyncio.TimeoutError:
+        # TERMINATOR (forces server to flush multi-packet responses)
+        writer.write(_rcon_packet(3, SERVERDATA_EXECCOMMAND, b""))
+        await writer.drain()
+
+        chunks: list[bytes] = []
+        deadline = time.time() + timeout
+
+        while time.time() < deadline:
+            pkt = await _rcon_read_packet(reader, timeout=0.6)
+            if not pkt:
                 break
-            if not part:
+            req_id, ptype, body = pkt
+            if ptype != SERVERDATA_RESPONSE_VALUE:
+                continue
+
+            # terminator response is usually req_id == 3 and empty body
+            if req_id == 3 and (body is None or len(body) == 0):
                 break
-            chunks.append(part)
+
+            if body:
+                chunks.append(body)
 
         if not chunks:
             return ""
 
-        data = b"".join(chunks)
-        out = []
-        i = 0
-        while i + 4 <= len(data):
-            size = int.from_bytes(data[i:i+4], "little", signed=True)
-            i += 4
-            if i + size > len(data) or size < 10:
-                break
-            pkt = data[i:i+size]
-            i += size
-            body = pkt[8:-2]
-            txt = body.decode("utf-8", errors="ignore")
-            if txt:
-                out.append(txt)
+        return _decode_rcon_text(b"".join(chunks)).strip()
 
-        return "".join(out).strip()
     finally:
         try:
             writer.close()
@@ -314,7 +367,7 @@ async def update_players_embed(session: aiohttp.ClientSession):
     rcon_ok = True
     rcon_err = None
     try:
-        out = await rcon_command("ListPlayers", timeout=6.0)
+        out = await rcon_command("ListPlayers", timeout=10.0)
         names = parse_listplayers(out)
     except Exception as e:
         rcon_ok = False
@@ -326,7 +379,8 @@ async def update_players_embed(session: aiohttp.ClientSession):
 
     if names:
         lines = [f"{idx+1:02d}) {n}" for idx, n in enumerate(names[:50])]
-        desc = f"**{count}/{PLAYER_CAP}** online\n\n" + "\n".join(lines)
+        player_list_text = "\n".join(lines)
+        desc = f"**{count}/{PLAYER_CAP}** online\n\n{player_list_text}"
     else:
         if not rcon_ok:
             desc = f"**{count}/{PLAYER_CAP}** online\n\n*(Could not fetch player names via RCON: {rcon_err})*"
@@ -346,60 +400,64 @@ async def update_players_embed(session: aiohttp.ClientSession):
 # =====================
 # GAMELOG SYNC HELPERS
 # =====================
-_DAYTIME_RE = re.compile(r"Day\s+(\d+),\s+(\d{1,2}):(\d{2}):(\d{2})\s*:")
+# Supports BOTH:
+#   Day 233, 17:45:33:
+#   Day 233, 17:45:33 -
+_DAYTIME_RE = re.compile(r"Day\s+(\d+),\s*(\d{1,2}):(\d{2}):(\d{2})\s*[:\-]")
 
-def parse_latest_daytime_from_gamelog(text: str):
-    """
-    Returns (day, hour, minute, second) from most recent matching line, or None.
-    """
+def parse_latest_daytime_from_gamelog(text: str) -> Optional[Tuple[int, int, int, int]]:
     if not text:
         return None
-
     lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
     for ln in reversed(lines):
         m = _DAYTIME_RE.search(ln)
         if not m:
             continue
-        return int(m.group(1)), int(m.group(2)), int(m.group(3)), int(m.group(4))
-
+        day = int(m.group(1))
+        hour = int(m.group(2))
+        minute = int(m.group(3))
+        second = int(m.group(4))
+        return day, hour, minute, second
     return None
-
-async def fetch_latest_daytime_via_rcon() -> tuple[int, int, int, int] | None:
-    """
-    ASA needs page indices: GetGameLog 1 (newest), 2, 3...
-    We scan the newest few pages and pick the latest parsable Day/time.
-    """
-    best = None
-    for page in range(1, max(1, int(GAMELOG_PAGES_TO_SCAN)) + 1):
-        text = await rcon_command(f"GetGameLog {page}", timeout=8.0)
-        if not text:
-            continue
-
-        # ASA placeholder string (means you forgot the page, or server didn't return)
-        if "Server received, But no response" in text:
-            continue
-
-        parsed = parse_latest_daytime_from_gamelog(text)
-        if parsed:
-            # Because we scan newest->older, the first hit is usually the best.
-            best = parsed
-            break
-
-    return best
 
 def minute_of_day_from_hm(hour: int, minute: int) -> int:
     return hour * 60 + minute
 
-def clamp_minute_diff(diff: int) -> int:
+def clamp_minutes(diff: int) -> int:
     while diff > 720:
         diff -= 1440
     while diff < -720:
         diff += 1440
     return diff
 
-def apply_gamelog_sync(parsed_day: int, parsed_hour: int, parsed_minute: int):
+def real_seconds_for_minute_delta(start_minute: int, delta_minutes: int) -> float:
     """
-    Adjust state['epoch'] so calculate_time_details() aligns with parsed in-game time NOW.
+    Convert an in-game minute delta into real seconds according to your day/night SPM model.
+    We step minute-by-minute so crossing sunrise/sunset stays accurate.
+    """
+    if delta_minutes == 0:
+        return 0.0
+    sign = 1 if delta_minutes > 0 else -1
+    steps = abs(delta_minutes)
+    total = 0.0
+    m = start_minute
+    d = 0
+    y = 0
+    for _ in range(steps):
+        total += spm(m)
+        # move 1 minute in the direction of delta
+        if sign > 0:
+            m, d, y = _advance_one_minute(m, d, y)
+        else:
+            m -= 1
+            if m < 0:
+                m = 1439
+    return total * sign
+
+def apply_gamelog_sync(parsed_day: int, parsed_hour: int, parsed_minute: int, parsed_second: int):
+    """
+    Adjust state['epoch'] so that NOW aligns with the parsed in-game time.
+    Uses seconds to tighten alignment.
     """
     global state
     if not state:
@@ -407,35 +465,47 @@ def apply_gamelog_sync(parsed_day: int, parsed_hour: int, parsed_minute: int):
 
     details = calculate_time_details()
     if not details:
-        return False, "No calculated time"
+        return False, "No calculated time details"
 
-    cur_minute_of_day, cur_day, cur_year, seconds_into_minute, cur_spm = details
-    target_minute_of_day = minute_of_day_from_hm(parsed_hour, parsed_minute)
+    cur_mod, cur_day, cur_year, seconds_into_minute, cur_spm = details
+    target_mod = minute_of_day_from_hm(parsed_hour, parsed_minute)
 
-    # handle day wrap within a year
+    # day diff within same year (you’re not using year rollover from logs)
     day_diff = parsed_day - cur_day
     if day_diff > 180:
         day_diff -= 365
     elif day_diff < -180:
         day_diff += 365
 
-    minute_diff = (day_diff * 1440) + (target_minute_of_day - cur_minute_of_day)
-    minute_diff = clamp_minute_diff(minute_diff)
+    minute_diff = (day_diff * 1440) + (target_mod - cur_mod)
+    minute_diff = clamp_minutes(minute_diff)
 
+    # If minute drift small, still allow seconds-level correction, but only if >= threshold minutes
     if abs(minute_diff) < SYNC_DRIFT_MINUTES:
         return False, f"Drift {minute_diff} min < threshold"
 
-    # shift epoch by the real seconds that correspond to that many in-game minutes
-    real_seconds_shift = minute_diff * spm(cur_minute_of_day)
-    state["epoch"] = float(state["epoch"]) - real_seconds_shift
+    # Convert minute drift to real seconds properly across sunrise/sunset
+    shift_seconds = real_seconds_for_minute_delta(cur_mod, minute_diff)
 
-    # keep displayed anchor consistent
+    # Now add a seconds alignment within the minute.
+    # Convert parsed in-game seconds (0..59) into real seconds into minute based on current minute spm.
+    desired_seconds_into_minute = (parsed_second / 60.0) * spm(target_mod)
+
+    # After shifting epoch for minute_diff, we want current seconds_into_minute to match desired.
+    # We adjust epoch further by the delta between our current seconds_into_minute and desired.
+    seconds_delta = seconds_into_minute - desired_seconds_into_minute
+    # Positive seconds_delta means we are "ahead" inside the minute -> move epoch forward a bit
+    fine_adjust = seconds_delta
+
+    state["epoch"] = float(state["epoch"]) - shift_seconds + fine_adjust
+
+    # Store the new anchor time (keeping your existing structure)
     state["day"] = int(parsed_day)
     state["hour"] = int(parsed_hour)
     state["minute"] = int(parsed_minute)
     save_state(state)
 
-    return True, f"Synced using GetGameLog (drift {minute_diff} min)"
+    return True, f"Synced using GetGameLog (minute drift {minute_diff}m)"
 
 # =====================
 # LOOPS
@@ -496,34 +566,40 @@ async def status_loop():
 
 _last_sync_ts = 0.0
 
-async def gamelog_sync_loop():
+async def try_sync_once() -> Tuple[bool, str]:
     global _last_sync_ts
+
+    if not state:
+        return False, "No state set (use /settime first)."
+
+    now = time.time()
+    if (now - _last_sync_ts) < SYNC_COOLDOWN_SECONDS:
+        remaining = int(SYNC_COOLDOWN_SECONDS - (now - _last_sync_ts))
+        return False, f"Sync cooldown active ({remaining}s remaining)."
+
+    log_text = await rcon_command("GetGameLog", timeout=15.0)
+    if not log_text:
+        return False, "GetGameLog returned empty output."
+
+    parsed = parse_latest_daytime_from_gamelog(log_text)
+    if not parsed:
+        return False, "No Day/Time found in GetGameLog."
+
+    d, h, m, s = parsed
+    changed, msg = apply_gamelog_sync(d, h, m, s)
+    if changed:
+        _last_sync_ts = time.time()
+    return changed, msg
+
+async def gamelog_sync_loop():
     await client.wait_until_ready()
 
     while True:
         try:
-            if not state:
-                await asyncio.sleep(GAMELOG_SYNC_SECONDS)
-                continue
-
-            now = time.time()
-            if (now - _last_sync_ts) < SYNC_COOLDOWN_SECONDS:
-                await asyncio.sleep(GAMELOG_SYNC_SECONDS)
-                continue
-
-            parsed = await fetch_latest_daytime_via_rcon()
-            if not parsed:
-                print("GameLog sync: no Day/time line found (scan pages 1..{})".format(GAMELOG_PAGES_TO_SCAN))
-                await asyncio.sleep(GAMELOG_SYNC_SECONDS)
-                continue
-
-            d, h, m, s = parsed
-            changed, msg = apply_gamelog_sync(d, h, m)
-            print(f"GameLog sync: {msg}")
-
+            changed, msg = await try_sync_once()
+            # Don’t spam logs; only print if it actually syncs or if there's a real error.
             if changed:
-                _last_sync_ts = time.time()
-
+                print("GameLog sync:", msg)
         except Exception as e:
             print(f"GameLog sync error: {e}")
 
@@ -561,46 +637,29 @@ async def status(i: discord.Interaction):
     await i.followup.send(f"{emoji} **Solunaris** — {count}/{PLAYER_CAP} players", ephemeral=True)
 
 @tree.command(name="sync", guild=discord.Object(id=GUILD_ID))
-async def sync_time(i: discord.Interaction):
-    """
-    Manually force a GetGameLog sync now.
-    """
+async def sync_cmd(i: discord.Interaction):
     await i.response.defer(ephemeral=True)
-
-    if not state:
-        await i.followup.send("❌ Time not set yet. Use `/settime` first.", ephemeral=True)
-        return
-
     try:
-        parsed = await fetch_latest_daytime_via_rcon()
-        if not parsed:
-            await i.followup.send("❌ No Day/Time found in GetGameLog.", ephemeral=True)
-            return
-
-        d, h, m, s = parsed
-        changed, msg = apply_gamelog_sync(d, h, m)
+        changed, msg = await try_sync_once()
         if changed:
-            global _last_sync_ts
-            _last_sync_ts = time.time()
-            await i.followup.send(f"✅ {msg} — now {h:02d}:{m:02d} Day {d}", ephemeral=True)
+            await i.followup.send(f"✅ {msg}", ephemeral=True)
         else:
-            await i.followup.send(f"ℹ️ {msg} — latest {h:02d}:{m:02d} Day {d}", ephemeral=True)
-
+            await i.followup.send(f"ℹ️ {msg}", ephemeral=True)
     except Exception as e:
         await i.followup.send(f"❌ Sync error: {e}", ephemeral=True)
 
 @tree.command(name="debuggamelog", guild=discord.Object(id=GUILD_ID))
 async def debuggamelog(i: discord.Interaction):
-    """
-    Shows first ~1200 chars of GetGameLog 1 so you can confirm output.
-    """
     await i.response.defer(ephemeral=True)
     try:
-        text = await rcon_command("GetGameLog 1", timeout=8.0)  # <-- FIX: page index required on ASA
+        text = await rcon_command("GetGameLog", timeout=15.0)
         if not text:
-            await i.followup.send("❌ Empty GetGameLog 1 response.", ephemeral=True)
+            await i.followup.send("❌ GetGameLog returned empty output.", ephemeral=True)
             return
-        snippet = text[:1200]
+        lines = [ln for ln in text.splitlines() if ln.strip()]
+        snippet = "\n".join(lines[-25:]) if lines else text[:1500]
+        if len(snippet) > 1800:
+            snippet = snippet[-1800:]
         await i.followup.send(f"```text\n{snippet}\n```", ephemeral=True)
     except Exception as e:
         await i.followup.send(f"❌ Debug error: {e}", ephemeral=True)
