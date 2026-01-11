@@ -5,6 +5,7 @@ import asyncio
 import aiohttp
 import discord
 from discord import app_commands
+import re
 
 # =====================
 # ENV
@@ -77,6 +78,15 @@ _last_vc_name = None
 # Time webhook: only update on round 10 minutes (00,10,20,30,40,50)
 TIME_UPDATE_STEP_MINUTES = 10
 
+# ====== NEW: GetGameLog sync ======
+GAMELOG_SYNC_SECONDS = 60         # how often to check GetGameLog for timestamps
+SYNC_DRIFT_MINUTES = 2            # resync if drift >= this many minutes
+SYNC_COOLDOWN_SECONDS = 120       # avoid resyncing too frequently
+_last_sync_ts = 0.0
+
+# Matches: "Day 216, 16:53:34" anywhere in line
+DAYTIME_RE = re.compile(r"Day\s+(\d+),\s*(\d{1,2}):(\d{2}):(\d{2})", re.IGNORECASE)
+
 # =====================
 # DISCORD SETUP
 # =====================
@@ -129,8 +139,9 @@ def _advance_one_minute(minute_of_day: int, day: int, year: int):
 
 def calculate_time_details():
     """
-    Like calculate_time(), but also returns:
+    Returns:
       - minute_of_day (0..1439)
+      - day, year
       - seconds_into_current_minute (real seconds since current in-game minute started)
       - current_minute_spm (real seconds per in-game minute for current minute)
     """
@@ -144,14 +155,12 @@ def calculate_time_details():
 
     remaining = elapsed
 
-    # Move forward whole in-game minutes while we have enough real seconds.
     while True:
         cur_spm = spm(minute_of_day)
         if remaining >= cur_spm:
             remaining -= cur_spm
             minute_of_day, day, year = _advance_one_minute(minute_of_day, day, year)
             continue
-        # remaining is now "seconds into current in-game minute"
         seconds_into_current_minute = remaining
         return minute_of_day, day, year, seconds_into_current_minute, cur_spm
 
@@ -166,33 +175,24 @@ def build_time_embed(minute_of_day: int, day: int, year: int):
 def seconds_until_next_round_step(minute_of_day: int, day: int, year: int, seconds_into_minute: float, step: int):
     """
     Returns real seconds until the next in-game minute where (minute % step == 0).
-    If currently exactly on a round step (minute%step==0), this schedules the NEXT one (step minutes ahead),
-    not "right now".
+    If currently exactly on a round step, schedules the NEXT one (step minutes ahead).
     """
-    # How many minutes to add to land on the next boundary:
-    # If we're on a boundary already, wait step minutes.
     m = minute_of_day
     mod = m % step
     minutes_to_boundary = (step - mod) if mod != 0 else step
 
-    # Time remaining in the current in-game minute (real seconds)
     cur_spm = spm(m)
     remaining_in_current_minute = max(0.0, cur_spm - seconds_into_minute)
 
-    # If boundary is in current minute (it isn't, because boundary is at minute transitions),
-    # we always need to finish current minute, then add more full minutes.
     total = remaining_in_current_minute
 
-    # Add the full minutes between the next minute and the boundary minute
-    # Example: if minutes_to_boundary == 1, boundary happens at the *next* minute tick,
-    # so we add 0 full minutes here.
     m2 = m
     d2, y2 = day, year
     for _ in range(minutes_to_boundary - 1):
         m2, d2, y2 = _advance_one_minute(m2, d2, y2)
         total += spm(m2)
 
-    return max(0.5, total)  # never spin too fast
+    return max(0.5, total)
 
 # =====================
 # NITRADO STATUS (COUNT)
@@ -353,6 +353,107 @@ async def update_players_embed(session: aiohttp.ClientSession):
     return emoji, count, online
 
 # =====================
+# NEW: GetGameLog Sync Helpers
+# =====================
+def _extract_latest_daytime_from_gamelog(text: str):
+    """
+    Returns (day:int, hour:int, minute:int, second:int) for the most recent match in GetGameLog output.
+    """
+    if not text:
+        return None
+    matches = list(DAYTIME_RE.finditer(text))
+    if not matches:
+        return None
+    m = matches[-1]
+    day = int(m.group(1))
+    hour = int(m.group(2))
+    minute = int(m.group(3))
+    second = int(m.group(4))
+    return day, hour, minute, second
+
+def _closest_year_day(current_year: int, current_day: int, observed_day: int):
+    """
+    Observed logs only include 'Day N' (no year).
+    Assume same year in most cases; if day looks like it wrapped, adjust.
+    """
+    # If we're near year boundary and the observed day is very low while current_day is very high,
+    # assume new year.
+    if current_day >= 360 and observed_day <= 5:
+        return current_year + 1, observed_day
+    # If we're very early in year and observed day is very high, assume previous year.
+    if current_day <= 5 and observed_day >= 360:
+        return max(1, current_year - 1), observed_day
+    return current_year, observed_day
+
+def _abs_minutes(year: int, day: int, minute_of_day: int) -> int:
+    return year * 365 * 1440 + day * 1440 + minute_of_day
+
+async def gamelog_sync_loop():
+    """
+    Periodically checks RCON GetGameLog for an authoritative 'Day X, HH:MM:SS' timestamp.
+    If the bot's time drift is too large, re-sync by resetting epoch to now and setting
+    day/hour/minute to the observed values.
+    """
+    global state, _last_sync_ts
+    await client.wait_until_ready()
+
+    while True:
+        try:
+            if not state:
+                await asyncio.sleep(GAMELOG_SYNC_SECONDS)
+                continue
+
+            # Don't spam resyncing
+            now = time.time()
+            if (now - _last_sync_ts) < SYNC_COOLDOWN_SECONDS:
+                await asyncio.sleep(GAMELOG_SYNC_SECONDS)
+                continue
+
+            out = await rcon_command("GetGameLog", timeout=8.0)
+            obs = _extract_latest_daytime_from_gamelog(out)
+            if not obs:
+                await asyncio.sleep(GAMELOG_SYNC_SECONDS)
+                continue
+
+            obs_day, obs_h, obs_m, obs_s = obs
+            obs_minute_of_day = obs_h * 60 + obs_m
+
+            # What does the bot think the time is right now?
+            details = calculate_time_details()
+            if not details:
+                await asyncio.sleep(GAMELOG_SYNC_SECONDS)
+                continue
+
+            cur_minute_of_day, cur_day, cur_year, seconds_into_minute, cur_spm = details
+
+            # Map observed day to a plausible year (logs don't show year)
+            fixed_year, fixed_day = _closest_year_day(cur_year, cur_day, obs_day)
+
+            # Compare in absolute minutes
+            cur_abs = _abs_minutes(cur_year, cur_day, cur_minute_of_day)
+            obs_abs = _abs_minutes(fixed_year, fixed_day, obs_minute_of_day)
+
+            drift_minutes = obs_abs - cur_abs
+
+            if abs(drift_minutes) >= SYNC_DRIFT_MINUTES:
+                # Hard resync: set bot state to observed time at "now"
+                state = {
+                    "epoch": time.time(),
+                    "year": int(fixed_year),
+                    "day": int(fixed_day),
+                    "hour": int(obs_h),
+                    "minute": int(obs_m),
+                }
+                save_state(state)
+                _last_sync_ts = time.time()
+                print(f"⏱️ Sync: drift={drift_minutes:+}min -> resynced to Day {fixed_day} {obs_h:02d}:{obs_m:02d}:{obs_s:02d} (Year {fixed_year})")
+
+        except Exception as e:
+            print(f"GetGameLog sync error: {e}")
+
+        await asyncio.sleep(GAMELOG_SYNC_SECONDS)
+
+# =====================
 # LOOPS
 # =====================
 async def time_loop():
@@ -363,14 +464,12 @@ async def time_loop():
         while True:
             details = calculate_time_details()
 
-            # If time hasn't been set yet, just wait a bit and try again
             if not details:
                 await asyncio.sleep(5)
                 continue
 
             minute_of_day, day, year, seconds_into_minute, cur_spm = details
 
-            # ONLY post time updates when the minute is a round 10 (00,10,20,30,40,50)
             if (minute_of_day % TIME_UPDATE_STEP_MINUTES) == 0:
                 embed = build_time_embed(minute_of_day, day, year)
                 await upsert_webhook(session, WEBHOOK_URL, "time", embed)
@@ -384,13 +483,11 @@ async def time_loop():
                         await ch.send(f"📅 **New Solunaris Day** — Day **{day}**, Year **{year}**")
                     last_announced_day = absolute_day
 
-                # We are on a boundary, so sleep until the NEXT boundary (10 minutes ahead in-game)
                 sleep_for = seconds_until_next_round_step(
                     minute_of_day, day, year, seconds_into_minute, TIME_UPDATE_STEP_MINUTES
                 )
                 await asyncio.sleep(sleep_for)
             else:
-                # Not on a boundary—sleep until the next boundary, then loop will post
                 sleep_for = seconds_until_next_round_step(
                     minute_of_day, day, year, seconds_into_minute, TIME_UPDATE_STEP_MINUTES
                 )
@@ -460,6 +557,7 @@ async def on_ready():
     await tree.sync(guild=discord.Object(id=GUILD_ID))
     client.loop.create_task(time_loop())
     client.loop.create_task(status_loop())
+    client.loop.create_task(gamelog_sync_loop())  # ✅ NEW
     print("✅ Solunaris bot online")
 
 client.run(DISCORD_TOKEN)
