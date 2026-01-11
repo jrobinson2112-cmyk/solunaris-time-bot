@@ -78,14 +78,15 @@ _last_vc_name = None
 # Time webhook: only update on round 10 minutes (00,10,20,30,40,50)
 TIME_UPDATE_STEP_MINUTES = 10
 
-# ====== NEW: GetGameLog sync ======
-GAMELOG_SYNC_SECONDS = 60         # how often to check GetGameLog for timestamps
-SYNC_DRIFT_MINUTES = 2            # resync if drift >= this many minutes
-SYNC_COOLDOWN_SECONDS = 120       # avoid resyncing too frequently
-_last_sync_ts = 0.0
+# =====================
+# GAMELOG SYNC (RCON)
+# =====================
+GAMELOG_SYNC_SECONDS = 120          # how often to check GetGameLog
+SYNC_DRIFT_MINUTES = 2              # only correct if drift >= this many in-game minutes
+SYNC_COOLDOWN_SECONDS = 600         # don't resync more than once per 10 minutes
 
-# Matches: "Day 216, 16:53:34" anywhere in line
-DAYTIME_RE = re.compile(r"Day\s+(\d+),\s*(\d{1,2}):(\d{2}):(\d{2})", re.IGNORECASE)
+# If you ONLY want lines that prove the time using your tribe events:
+SYNC_TRIBE_FILTER = "Tribe Valkyrie"   # set to None to accept any Day/time line
 
 # =====================
 # DISCORD SETUP
@@ -139,9 +140,8 @@ def _advance_one_minute(minute_of_day: int, day: int, year: int):
 
 def calculate_time_details():
     """
-    Returns:
+    Like calculate_time(), but also returns:
       - minute_of_day (0..1439)
-      - day, year
       - seconds_into_current_minute (real seconds since current in-game minute started)
       - current_minute_spm (real seconds per in-game minute for current minute)
     """
@@ -155,12 +155,14 @@ def calculate_time_details():
 
     remaining = elapsed
 
+    # Move forward whole in-game minutes while we have enough real seconds.
     while True:
         cur_spm = spm(minute_of_day)
         if remaining >= cur_spm:
             remaining -= cur_spm
             minute_of_day, day, year = _advance_one_minute(minute_of_day, day, year)
             continue
+        # remaining is now "seconds into current in-game minute"
         seconds_into_current_minute = remaining
         return minute_of_day, day, year, seconds_into_current_minute, cur_spm
 
@@ -175,7 +177,8 @@ def build_time_embed(minute_of_day: int, day: int, year: int):
 def seconds_until_next_round_step(minute_of_day: int, day: int, year: int, seconds_into_minute: float, step: int):
     """
     Returns real seconds until the next in-game minute where (minute % step == 0).
-    If currently exactly on a round step, schedules the NEXT one (step minutes ahead).
+    If currently exactly on a round step (minute%step==0), this schedules the NEXT one (step minutes ahead),
+    not "right now".
     """
     m = minute_of_day
     mod = m % step
@@ -183,7 +186,6 @@ def seconds_until_next_round_step(minute_of_day: int, day: int, year: int, secon
 
     cur_spm = spm(m)
     remaining_in_current_minute = max(0.0, cur_spm - seconds_into_minute)
-
     total = remaining_in_current_minute
 
     m2 = m
@@ -353,105 +355,82 @@ async def update_players_embed(session: aiohttp.ClientSession):
     return emoji, count, online
 
 # =====================
-# NEW: GetGameLog Sync Helpers
+# GAMELOG SYNC HELPERS
 # =====================
-def _extract_latest_daytime_from_gamelog(text: str):
+_DAYTIME_RE = re.compile(r"Day\s+(\d+),\s+(\d{1,2}):(\d{2}):(\d{2})\s*:")
+
+def parse_latest_daytime_from_gamelog(text: str, tribe_filter: str | None):
     """
-    Returns (day:int, hour:int, minute:int, second:int) for the most recent match in GetGameLog output.
+    Returns (day:int, hour:int, minute:int, second:int) from the most recent matching line, or None.
+    We scan from the bottom because GetGameLog can be large.
     """
     if not text:
         return None
-    matches = list(DAYTIME_RE.finditer(text))
-    if not matches:
-        return None
-    m = matches[-1]
-    day = int(m.group(1))
-    hour = int(m.group(2))
-    minute = int(m.group(3))
-    second = int(m.group(4))
-    return day, hour, minute, second
 
-def _closest_year_day(current_year: int, current_day: int, observed_day: int):
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    for ln in reversed(lines):
+        if tribe_filter and tribe_filter.lower() not in ln.lower():
+            continue
+
+        m = _DAYTIME_RE.search(ln)
+        if not m:
+            continue
+
+        day = int(m.group(1))
+        hour = int(m.group(2))
+        minute = int(m.group(3))
+        second = int(m.group(4))
+        return day, hour, minute, second
+
+    return None
+
+def minute_of_day_from_hms(hour: int, minute: int) -> int:
+    return hour * 60 + minute
+
+def clamp_minute_diff(diff: int) -> int:
+    while diff > 720:
+        diff -= 1440
+    while diff < -720:
+        diff += 1440
+    return diff
+
+def apply_gamelog_sync(parsed_day: int, parsed_hour: int, parsed_minute: int):
     """
-    Observed logs only include 'Day N' (no year).
-    Assume same year in most cases; if day looks like it wrapped, adjust.
+    Adjust state['epoch'] so that calculate_time_details() aligns with the parsed in-game time *now*.
+    We only adjust epoch (the anchor), we do not change your SPM model.
     """
-    # If we're near year boundary and the observed day is very low while current_day is very high,
-    # assume new year.
-    if current_day >= 360 and observed_day <= 5:
-        return current_year + 1, observed_day
-    # If we're very early in year and observed day is very high, assume previous year.
-    if current_day <= 5 and observed_day >= 360:
-        return max(1, current_year - 1), observed_day
-    return current_year, observed_day
+    global state
+    if not state:
+        return False, "No state set"
 
-def _abs_minutes(year: int, day: int, minute_of_day: int) -> int:
-    return year * 365 * 1440 + day * 1440 + minute_of_day
+    details = calculate_time_details()
+    if not details:
+        return False, "No calculated time details"
 
-async def gamelog_sync_loop():
-    """
-    Periodically checks RCON GetGameLog for an authoritative 'Day X, HH:MM:SS' timestamp.
-    If the bot's time drift is too large, re-sync by resetting epoch to now and setting
-    day/hour/minute to the observed values.
-    """
-    global state, _last_sync_ts
-    await client.wait_until_ready()
+    cur_minute_of_day, cur_day, cur_year, seconds_into_minute, cur_spm = details
+    target_minute_of_day = minute_of_day_from_hms(parsed_hour, parsed_minute)
 
-    while True:
-        try:
-            if not state:
-                await asyncio.sleep(GAMELOG_SYNC_SECONDS)
-                continue
+    day_diff = parsed_day - cur_day
+    if day_diff > 180:
+        day_diff -= 365
+    elif day_diff < -180:
+        day_diff += 365
 
-            # Don't spam resyncing
-            now = time.time()
-            if (now - _last_sync_ts) < SYNC_COOLDOWN_SECONDS:
-                await asyncio.sleep(GAMELOG_SYNC_SECONDS)
-                continue
+    minute_diff = (day_diff * 1440) + (target_minute_of_day - cur_minute_of_day)
+    minute_diff = clamp_minute_diff(minute_diff)
 
-            out = await rcon_command("GetGameLog", timeout=8.0)
-            obs = _extract_latest_daytime_from_gamelog(out)
-            if not obs:
-                await asyncio.sleep(GAMELOG_SYNC_SECONDS)
-                continue
+    if abs(minute_diff) < SYNC_DRIFT_MINUTES:
+        return False, f"Drift {minute_diff} min < threshold"
 
-            obs_day, obs_h, obs_m, obs_s = obs
-            obs_minute_of_day = obs_h * 60 + obs_m
+    real_seconds_shift = minute_diff * spm(cur_minute_of_day)
 
-            # What does the bot think the time is right now?
-            details = calculate_time_details()
-            if not details:
-                await asyncio.sleep(GAMELOG_SYNC_SECONDS)
-                continue
+    state["epoch"] = float(state["epoch"]) - real_seconds_shift
+    state["day"] = int(parsed_day)
+    state["hour"] = int(parsed_hour)
+    state["minute"] = int(parsed_minute)
+    save_state(state)
 
-            cur_minute_of_day, cur_day, cur_year, seconds_into_minute, cur_spm = details
-
-            # Map observed day to a plausible year (logs don't show year)
-            fixed_year, fixed_day = _closest_year_day(cur_year, cur_day, obs_day)
-
-            # Compare in absolute minutes
-            cur_abs = _abs_minutes(cur_year, cur_day, cur_minute_of_day)
-            obs_abs = _abs_minutes(fixed_year, fixed_day, obs_minute_of_day)
-
-            drift_minutes = obs_abs - cur_abs
-
-            if abs(drift_minutes) >= SYNC_DRIFT_MINUTES:
-                # Hard resync: set bot state to observed time at "now"
-                state = {
-                    "epoch": time.time(),
-                    "year": int(fixed_year),
-                    "day": int(fixed_day),
-                    "hour": int(obs_h),
-                    "minute": int(obs_m),
-                }
-                save_state(state)
-                _last_sync_ts = time.time()
-                print(f"⏱️ Sync: drift={drift_minutes:+}min -> resynced to Day {fixed_day} {obs_h:02d}:{obs_m:02d}:{obs_s:02d} (Year {fixed_year})")
-
-        except Exception as e:
-            print(f"GetGameLog sync error: {e}")
-
-        await asyncio.sleep(GAMELOG_SYNC_SECONDS)
+    return True, f"Synced using gamelog (drift {minute_diff} min)"
 
 # =====================
 # LOOPS
@@ -516,6 +495,43 @@ async def status_loop():
 
             await asyncio.sleep(STATUS_POLL_SECONDS)
 
+_last_sync_ts = 0.0
+
+async def gamelog_sync_loop():
+    global _last_sync_ts
+    await client.wait_until_ready()
+
+    while True:
+        try:
+            if not state:
+                await asyncio.sleep(GAMELOG_SYNC_SECONDS)
+                continue
+
+            now = time.time()
+            if (now - _last_sync_ts) < SYNC_COOLDOWN_SECONDS:
+                await asyncio.sleep(GAMELOG_SYNC_SECONDS)
+                continue
+
+            log_text = await rcon_command("GetGameLog", timeout=8.0)
+
+            parsed = parse_latest_daytime_from_gamelog(log_text, SYNC_TRIBE_FILTER)
+            if not parsed:
+                print("GameLog sync: no parsable Day/time line found")
+                await asyncio.sleep(GAMELOG_SYNC_SECONDS)
+                continue
+
+            d, h, m, s = parsed
+            changed, msg = apply_gamelog_sync(d, h, m)
+            print(f"GameLog sync: {msg}")
+
+            if changed:
+                _last_sync_ts = time.time()
+
+        except Exception as e:
+            print(f"GameLog sync error: {e}")
+
+        await asyncio.sleep(GAMELOG_SYNC_SECONDS)
+
 # =====================
 # COMMANDS
 # =====================
@@ -557,7 +573,7 @@ async def on_ready():
     await tree.sync(guild=discord.Object(id=GUILD_ID))
     client.loop.create_task(time_loop())
     client.loop.create_task(status_loop())
-    client.loop.create_task(gamelog_sync_loop())  # ✅ NEW
+    client.loop.create_task(gamelog_sync_loop())
     print("✅ Solunaris bot online")
 
 client.run(DISCORD_TOKEN)
