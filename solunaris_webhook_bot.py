@@ -426,6 +426,52 @@ def hard_sync_to_gamelog(parsed_day: int, parsed_hour: int, parsed_minute: int, 
     return True, "Hard-synced to GetGameLog timestamp"
 
 # =====================
+# SYNC CORE (shared by loop + /sync)
+# =====================
+_last_sync_ts = 0.0
+_last_sync_sig = None
+
+async def run_gamelog_sync(force: bool = False) -> tuple[bool, str]:
+    """
+    Returns (changed, message).
+    If force=True, bypass cooldown (but still dedupes on identical last log line).
+    """
+    global _last_sync_ts, _last_sync_sig, state
+
+    if not state:
+        return False, "No time state set yet. Use /settime first."
+
+    now = time.time()
+    if not force and (now - _last_sync_ts) < SYNC_COOLDOWN_SECONDS:
+        wait_left = int(SYNC_COOLDOWN_SECONDS - (now - _last_sync_ts))
+        return False, f"Cooldown active. Try again in ~{wait_left}s."
+
+    log_text = await rcon_command("GetGameLog", timeout=10.0)
+    parsed = parse_latest_daytime_from_gamelog(log_text, SYNC_TRIBE_FILTER)
+    if not parsed:
+        return False, "No parsable 'Day X, HH:MM:SS:' line found in GetGameLog."
+
+    d, h, m, s, sig = parsed
+
+    if _last_sync_sig == sig and not force:
+        return False, "No new GetGameLog timestamp line since last sync."
+
+    drift = compute_drift_minutes(d, h, m)
+    if drift is None:
+        return False, "Could not compute drift (no local time details)."
+
+    if abs(drift) < SYNC_DRIFT_MINUTES and not force:
+        _last_sync_sig = sig
+        return False, f"Drift {drift} min < threshold ({SYNC_DRIFT_MINUTES}). No change."
+
+    changed, msg = hard_sync_to_gamelog(d, h, m, s)
+    _last_sync_ts = time.time()
+    _last_sync_sig = sig
+
+    # Also force a time webhook update immediately after a manual sync
+    return changed, f"{msg}. Server says Day {d} {h:02d}:{m:02d}:{s:02d} (drift was {drift} min)."
+
+# =====================
 # LOOPS
 # =====================
 async def time_loop():
@@ -488,56 +534,18 @@ async def status_loop():
 
             await asyncio.sleep(STATUS_POLL_SECONDS)
 
-_last_sync_ts = 0.0
-_last_sync_sig = None
-
 async def gamelog_sync_loop():
-    global _last_sync_ts, _last_sync_sig
     await client.wait_until_ready()
 
     while True:
         try:
-            if not state:
-                await asyncio.sleep(GAMELOG_SYNC_SECONDS)
-                continue
-
-            now = time.time()
-            if (now - _last_sync_ts) < SYNC_COOLDOWN_SECONDS:
-                await asyncio.sleep(GAMELOG_SYNC_SECONDS)
-                continue
-
-            log_text = await rcon_command("GetGameLog", timeout=10.0)
-            parsed = parse_latest_daytime_from_gamelog(log_text, SYNC_TRIBE_FILTER)
-
-            if not parsed:
-                print("GameLog sync: no parsable Day/time line found")
-                await asyncio.sleep(GAMELOG_SYNC_SECONDS)
-                continue
-
-            d, h, m, s, sig = parsed
-
-            if _last_sync_sig == sig:
-                await asyncio.sleep(GAMELOG_SYNC_SECONDS)
-                continue
-
-            drift = compute_drift_minutes(d, h, m)
-            if drift is None:
-                await asyncio.sleep(GAMELOG_SYNC_SECONDS)
-                continue
-
-            if abs(drift) < SYNC_DRIFT_MINUTES:
-                print(f"GameLog sync: drift {drift} min < threshold (no change)")
-                _last_sync_sig = sig
-                await asyncio.sleep(GAMELOG_SYNC_SECONDS)
-                continue
-
-            changed, msg = hard_sync_to_gamelog(d, h, m, s)
-            print(f"GameLog sync: {msg} (drift was {drift} min)")
-
+            changed, msg = await run_gamelog_sync(force=False)
             if changed:
-                _last_sync_ts = time.time()
-                _last_sync_sig = sig
-
+                print("GameLog sync:", msg)
+            else:
+                # Keep logs quieter; uncomment if you want chatter
+                # print("GameLog sync:", msg)
+                pass
         except Exception as e:
             print(f"GameLog sync error: {e}")
 
@@ -575,6 +583,30 @@ async def status(i: discord.Interaction):
         emoji, count, online = await update_players_embed(session)
 
     await i.followup.send(f"{emoji} **Solunaris** — {count}/{PLAYER_CAP} players", ephemeral=True)
+
+@tree.command(name="sync", guild=discord.Object(id=GUILD_ID))
+async def sync(i: discord.Interaction):
+    """
+    Force an immediate GetGameLog poll + time sync.
+    """
+    if not any(r.id == ADMIN_ROLE_ID for r in i.user.roles):
+        await i.response.send_message("❌ No permission", ephemeral=True)
+        return
+
+    await i.response.defer(ephemeral=True)
+
+    try:
+        changed, msg = await run_gamelog_sync(force=True)
+        # Push an immediate webhook update after a forced sync (even if it didn't change)
+        async with aiohttp.ClientSession() as session:
+            details = calculate_time_details()
+            if details:
+                minute_of_day, day, year, seconds_into_minute, cur_spm = details
+                embed = build_time_embed(minute_of_day, day, year)
+                await upsert_webhook(session, WEBHOOK_URL, "time", embed)
+        await i.followup.send(("✅ " if changed else "ℹ️ ") + msg, ephemeral=True)
+    except Exception as e:
+        await i.followup.send(f"❌ Sync failed: {e}", ephemeral=True)
 
 # =====================
 # START
