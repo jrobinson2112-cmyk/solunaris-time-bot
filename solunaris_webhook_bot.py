@@ -6,6 +6,7 @@ import aiohttp
 import discord
 from discord import app_commands
 import re
+import hashlib
 
 # =====================
 # ENV
@@ -57,6 +58,7 @@ STATUS_VC_ID = 1456615806887657606
 ANNOUNCE_CHANNEL_ID = 1430388267446042666
 PLAYER_CAP = 42
 
+# Your current model (kept as-is)
 DAY_SPM = 4.7666667
 NIGHT_SPM = 4.045
 SUNRISE = 5 * 60 + 30
@@ -85,8 +87,8 @@ GAMELOG_SYNC_SECONDS = 120          # how often to check GetGameLog
 SYNC_DRIFT_MINUTES = 2              # only correct if drift >= this many in-game minutes
 SYNC_COOLDOWN_SECONDS = 600         # don't resync more than once per 10 minutes
 
-# If you ONLY want lines that prove the time using your tribe events:
-SYNC_TRIBE_FILTER = "Tribe Valkyrie"   # set to None to accept any Day/time line
+# Accept ANY Day/time line in GetGameLog
+SYNC_TRIBE_FILTER = None
 
 # =====================
 # DISCORD SETUP
@@ -140,8 +142,9 @@ def _advance_one_minute(minute_of_day: int, day: int, year: int):
 
 def calculate_time_details():
     """
-    Like calculate_time(), but also returns:
+    Returns:
       - minute_of_day (0..1439)
+      - day, year
       - seconds_into_current_minute (real seconds since current in-game minute started)
       - current_minute_spm (real seconds per in-game minute for current minute)
     """
@@ -155,14 +158,12 @@ def calculate_time_details():
 
     remaining = elapsed
 
-    # Move forward whole in-game minutes while we have enough real seconds.
     while True:
         cur_spm = spm(minute_of_day)
         if remaining >= cur_spm:
             remaining -= cur_spm
             minute_of_day, day, year = _advance_one_minute(minute_of_day, day, year)
             continue
-        # remaining is now "seconds into current in-game minute"
         seconds_into_current_minute = remaining
         return minute_of_day, day, year, seconds_into_current_minute, cur_spm
 
@@ -175,11 +176,6 @@ def build_time_embed(minute_of_day: int, day: int, year: int):
     return {"title": title, "color": color}
 
 def seconds_until_next_round_step(minute_of_day: int, day: int, year: int, seconds_into_minute: float, step: int):
-    """
-    Returns real seconds until the next in-game minute where (minute % step == 0).
-    If currently exactly on a round step (minute%step==0), this schedules the NEXT one (step minutes ahead),
-    not "right now".
-    """
     m = minute_of_day
     mod = m % step
     minutes_to_boundary = (step - mod) if mod != 0 else step
@@ -359,11 +355,10 @@ async def update_players_embed(session: aiohttp.ClientSession):
 # =====================
 _DAYTIME_RE = re.compile(r"Day\s+(\d+),\s+(\d{1,2}):(\d{2}):(\d{2})\s*:")
 
+def _sig_for_line(line: str) -> str:
+    return hashlib.sha1(line.encode("utf-8", errors="ignore")).hexdigest()[:12]
+
 def parse_latest_daytime_from_gamelog(text: str, tribe_filter: str | None):
-    """
-    Returns (day:int, hour:int, minute:int, second:int) from the most recent matching line, or None.
-    We scan from the bottom because GetGameLog can be large.
-    """
     if not text:
         return None
 
@@ -380,11 +375,11 @@ def parse_latest_daytime_from_gamelog(text: str, tribe_filter: str | None):
         hour = int(m.group(2))
         minute = int(m.group(3))
         second = int(m.group(4))
-        return day, hour, minute, second
+        return day, hour, minute, second, _sig_for_line(ln)
 
     return None
 
-def minute_of_day_from_hms(hour: int, minute: int) -> int:
+def minute_of_day_from_hm(hour: int, minute: int) -> int:
     return hour * 60 + minute
 
 def clamp_minute_diff(diff: int) -> int:
@@ -394,21 +389,13 @@ def clamp_minute_diff(diff: int) -> int:
         diff += 1440
     return diff
 
-def apply_gamelog_sync(parsed_day: int, parsed_hour: int, parsed_minute: int):
-    """
-    Adjust state['epoch'] so that calculate_time_details() aligns with the parsed in-game time *now*.
-    We only adjust epoch (the anchor), we do not change your SPM model.
-    """
-    global state
-    if not state:
-        return False, "No state set"
-
+def compute_drift_minutes(parsed_day: int, parsed_hour: int, parsed_minute: int):
     details = calculate_time_details()
     if not details:
-        return False, "No calculated time details"
+        return None
 
     cur_minute_of_day, cur_day, cur_year, seconds_into_minute, cur_spm = details
-    target_minute_of_day = minute_of_day_from_hms(parsed_hour, parsed_minute)
+    target_minute_of_day = minute_of_day_from_hm(parsed_hour, parsed_minute)
 
     day_diff = parsed_day - cur_day
     if day_diff > 180:
@@ -417,20 +404,26 @@ def apply_gamelog_sync(parsed_day: int, parsed_hour: int, parsed_minute: int):
         day_diff += 365
 
     minute_diff = (day_diff * 1440) + (target_minute_of_day - cur_minute_of_day)
-    minute_diff = clamp_minute_diff(minute_diff)
+    return clamp_minute_diff(minute_diff)
 
-    if abs(minute_diff) < SYNC_DRIFT_MINUTES:
-        return False, f"Drift {minute_diff} min < threshold"
+def hard_sync_to_gamelog(parsed_day: int, parsed_hour: int, parsed_minute: int, parsed_second: int):
+    global state
+    if not state:
+        return False, "No state set"
 
-    real_seconds_shift = minute_diff * spm(cur_minute_of_day)
+    now = time.time()
+    target_minute_of_day = minute_of_day_from_hm(parsed_hour, parsed_minute)
 
-    state["epoch"] = float(state["epoch"]) - real_seconds_shift
+    real_seconds_per_game_second = spm(target_minute_of_day) / 60.0
+    seconds_into_minute_real = float(parsed_second) * real_seconds_per_game_second
+
+    state["epoch"] = now - seconds_into_minute_real
     state["day"] = int(parsed_day)
     state["hour"] = int(parsed_hour)
     state["minute"] = int(parsed_minute)
     save_state(state)
 
-    return True, f"Synced using gamelog (drift {minute_diff} min)"
+    return True, "Hard-synced to GetGameLog timestamp"
 
 # =====================
 # LOOPS
@@ -496,9 +489,10 @@ async def status_loop():
             await asyncio.sleep(STATUS_POLL_SECONDS)
 
 _last_sync_ts = 0.0
+_last_sync_sig = None
 
 async def gamelog_sync_loop():
-    global _last_sync_ts
+    global _last_sync_ts, _last_sync_sig
     await client.wait_until_ready()
 
     while True:
@@ -512,20 +506,37 @@ async def gamelog_sync_loop():
                 await asyncio.sleep(GAMELOG_SYNC_SECONDS)
                 continue
 
-            log_text = await rcon_command("GetGameLog", timeout=8.0)
-
+            log_text = await rcon_command("GetGameLog", timeout=10.0)
             parsed = parse_latest_daytime_from_gamelog(log_text, SYNC_TRIBE_FILTER)
+
             if not parsed:
                 print("GameLog sync: no parsable Day/time line found")
                 await asyncio.sleep(GAMELOG_SYNC_SECONDS)
                 continue
 
-            d, h, m, s = parsed
-            changed, msg = apply_gamelog_sync(d, h, m)
-            print(f"GameLog sync: {msg}")
+            d, h, m, s, sig = parsed
+
+            if _last_sync_sig == sig:
+                await asyncio.sleep(GAMELOG_SYNC_SECONDS)
+                continue
+
+            drift = compute_drift_minutes(d, h, m)
+            if drift is None:
+                await asyncio.sleep(GAMELOG_SYNC_SECONDS)
+                continue
+
+            if abs(drift) < SYNC_DRIFT_MINUTES:
+                print(f"GameLog sync: drift {drift} min < threshold (no change)")
+                _last_sync_sig = sig
+                await asyncio.sleep(GAMELOG_SYNC_SECONDS)
+                continue
+
+            changed, msg = hard_sync_to_gamelog(d, h, m, s)
+            print(f"GameLog sync: {msg} (drift was {drift} min)")
 
             if changed:
                 _last_sync_ts = time.time()
+                _last_sync_sig = sig
 
         except Exception as e:
             print(f"GameLog sync error: {e}")
